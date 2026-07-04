@@ -43,7 +43,10 @@ class Activity {
 
   virtual bool skipLoopDelay() { return false; }
   virtual bool preventAutoSleep() { return false; }
+  virtual bool suppressAutoDeepSleep() { return false; }
+  virtual bool ownsPowerManagement() { return false; }
   virtual bool isReaderActivity() const { return false; }
+  virtual bool isCompanionActivity() const { return false; }
   virtual ScreenshotInfo getScreenshotInfo() const { return {}; }
 
   // Start a new activity without destroying the current one

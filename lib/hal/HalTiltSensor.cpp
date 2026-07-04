@@ -51,6 +51,24 @@ bool HalTiltSensor::readGyro(float& gx, float& gy, float& gz) const {
   return true;
 }
 
+bool HalTiltSensor::runCtrl9Command(uint8_t command) const {
+  if (!writeReg(REG_CTRL9, command)) {
+    return false;
+  }
+
+  const unsigned long start = millis();
+  uint8_t statusInt = 0;
+  do {
+    delay(1);
+    if (readReg(REG_STATUSINT, &statusInt) && (statusInt & STATUSINT_CMD_DONE)) {
+      return writeReg(REG_CTRL9, CTRL9_CMD_ACK);
+    }
+  } while (millis() - start < 100);
+
+  LOG_ERR("GYR", "CTRL9 command 0x%02X timed out", command);
+  return false;
+}
+
 void HalTiltSensor::begin() {
   if (!gpio.deviceIsX3()) {
     _available = false;
@@ -125,6 +143,85 @@ bool HalTiltSensor::deepSleep() {
     LOG_ERR("GYR", "Failed to put QMI8658 to sleep");
     return false;
   }
+}
+
+bool HalTiltSensor::readGyroDps(float& gx, float& gy, float& gz) const {
+  if (!_available) {
+    return false;
+  }
+  return readGyro(gx, gy, gz);
+}
+
+bool HalTiltSensor::readStatus(uint8_t& statusInt, uint8_t& status0, uint8_t& status1) const {
+  if (!_available) {
+    statusInt = 0;
+    status0 = 0;
+    status1 = 0;
+    return false;
+  }
+
+  return readReg(REG_STATUSINT, &statusInt) && readReg(REG_STATUS0, &status0) && readReg(REG_STATUS1, &status1);
+}
+
+bool HalTiltSensor::enableWakeOnMotionInterrupt(bool useInt1, uint8_t thresholdMg, uint8_t blankingSamples,
+                                                bool initialHigh) {
+  if (!_available || thresholdMg == 0) {
+    return false;
+  }
+
+  if (blankingSamples > 0x3F) {
+    blankingSamples = 0x3F;
+  }
+  const uint8_t interruptSelect = useInt1 ? (initialHigh ? WOM_INT1_INITIAL_HIGH : WOM_INT1_INITIAL_LOW)
+                                          : (initialHigh ? WOM_INT2_INITIAL_HIGH : WOM_INT2_INITIAL_LOW);
+  const uint8_t cal1H = interruptSelect | blankingSamples;
+  const uint8_t intEnable = useInt1 ? CTRL1_INT1_ENABLE : CTRL1_INT2_ENABLE;
+
+  if (!writeReg(REG_CTRL7, CTRL7_DISABLE_ALL) || !writeReg(REG_CTRL1, CTRL1_BASE | intEnable) ||
+      !writeReg(REG_CTRL2, CTRL2_FS_2G | CTRL2_ODR_21HZ_LOW_POWER) ||
+      !writeReg(REG_CTRL8, CTRL8_CTRL9_STATUSINT_HANDSHAKE) || !writeReg(REG_CAL1_L, thresholdMg) ||
+      !writeReg(REG_CAL1_H, cal1H) || !runCtrl9Command(CTRL9_CMD_WRITE_WOM_SETTING) ||
+      !writeReg(REG_CTRL7, CTRL7_ACCEL_ENABLE)) {
+    LOG_ERR("GYR", "Failed to enable QMI8658 WoM on %s", useInt1 ? "INT1" : "INT2");
+    return false;
+  }
+
+  _isAwake = true;
+  clearPendingEvents();
+  _inTilt = false;
+  LOG_INF("GYR", "QMI8658 WoM enabled on %s threshold=%umg blanking=%u initial=%s", useInt1 ? "INT1" : "INT2",
+          thresholdMg, blankingSamples, initialHigh ? "high" : "low");
+  return true;
+}
+
+bool HalTiltSensor::enableWakeOnMotionInt1(uint8_t thresholdMg, uint8_t blankingSamples, bool initialHigh) {
+  return enableWakeOnMotionInterrupt(true, thresholdMg, blankingSamples, initialHigh);
+}
+
+bool HalTiltSensor::disableWakeOnMotion() {
+  if (!_available) {
+    return false;
+  }
+
+  uint8_t ignored = 0;
+  readReg(REG_STATUS1, &ignored);
+
+  const bool ok = writeReg(REG_CTRL7, CTRL7_DISABLE_ALL) && writeReg(REG_CAL1_L, 0x00) && writeReg(REG_CAL1_H, 0x00) &&
+                  writeReg(REG_CTRL8, CTRL8_CTRL9_STATUSINT_HANDSHAKE) &&
+                  runCtrl9Command(CTRL9_CMD_WRITE_WOM_SETTING) &&
+                  writeReg(REG_CTRL3, CTRL3_FS_512DPS | CTRL3_ODR_28HZ) &&
+                  writeReg(REG_CTRL1, CTRL1_BASE | CTRL1_SENSOR_DISABLE) &&
+                  writeReg(REG_CTRL7, CTRL7_DISABLE_ALL);
+  if (!ok) {
+    LOG_ERR("GYR", "Failed to disable QMI8658 WoM");
+    return false;
+  }
+
+  _isAwake = false;
+  clearPendingEvents();
+  _inTilt = false;
+  LOG_INF("GYR", "QMI8658 WoM disabled");
+  return true;
 }
 
 void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const bool inReader) {

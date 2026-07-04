@@ -806,9 +806,16 @@ def _append_string_entry(lines: List[str], text: str, comment: str = "") -> None
 
 
 def _write_file(path: str, lines: List[str], verbose: bool = False) -> None:
+    content = "\n".join(lines) + "\n"
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as existing:
+            if existing.read() == content:
+                if verbose:
+                    print(f"Unchanged: {path}")
+                return
+
     with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(lines))
-        f.write("\n")
+        f.write(content)
     if verbose:
         print(f"Generated: {path}")
 

@@ -32,6 +32,7 @@ import re
 import signal
 import sys
 import threading
+import time
 from collections import deque
 from datetime import datetime
 
@@ -72,31 +73,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
 if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
     build_arg_parser().parse_args()
 
-# Try to import potentially missing packages
-PACKAGE_MAPPING: dict[str, str] = {
-    "serial": "pyserial",
-    "colorama": "colorama",
-    "matplotlib": "matplotlib",
-    "PIL": "Pillow",
-}
-
 try:
-    import matplotlib.pyplot as plt
     import serial
     from colorama import Fore, Style, init
-    from matplotlib import animation
-
-    try:
-        from PIL import Image
-    except ImportError:
-        Image = None
 except ImportError as e:
     ERROR_MSG = str(e).lower()
-    missing_packages = [pkg for mod, pkg in PACKAGE_MAPPING.items() if mod in ERROR_MSG]
+    package_mapping: dict[str, str] = {
+        "serial": "pyserial",
+        "colorama": "colorama",
+    }
+    missing_packages = [pkg for mod, pkg in package_mapping.items() if mod in ERROR_MSG]
 
     if not missing_packages:
         # Fallback if mapping doesn't cover
-        missing_packages = ["pyserial", "colorama", "matplotlib"]
+        missing_packages = ["pyserial", "colorama"]
 
     print("\n" + "!" * 50)
     print(f" Error: Required package(s) not installed: {', '.join(missing_packages)}")
@@ -108,6 +98,18 @@ except ImportError as e:
 
     print("\nExiting...")
     sys.exit(1)
+
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib import animation
+except ImportError:
+    plt = None
+    animation = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 # --- Global Variables for Data Sharing ---
 # Store last 50 data points
@@ -195,7 +197,8 @@ def signal_handler(signum, frame):
     del frame  # Explicitly mark as unused to satisfy linters
     print(f"\n{Fore.YELLOW}Received signal {signum}. Shutting down...{Style.RESET_ALL}")
     shutdown_event.set()
-    plt.close("all")
+    if plt:
+        plt.close("all")
 
 
 # pylint: disable=R0912
@@ -478,6 +481,22 @@ def main() -> None:
     input_thread = threading.Thread(target=input_worker, args=(ser,), daemon=True)
     input_thread.start()
 
+    if not plt or not animation:
+        print(
+            f"{Fore.YELLOW}Matplotlib not installed; running console monitor only."
+            f"{Style.RESET_ALL}"
+        )
+        print(f"{Fore.YELLOW}Press Ctrl-C to exit.{Style.RESET_ALL}")
+        try:
+            while t.is_alive() and not shutdown_event.is_set():
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            print(f"\n{Fore.YELLOW}Exiting...{Style.RESET_ALL}")
+        finally:
+            shutdown_event.set()
+            ser.close()
+        return
+
     # 2. Set up the Graph (Main Thread)
     try:
         import matplotlib.style as mplstyle  # pylint: disable=import-outside-toplevel
@@ -515,6 +534,7 @@ def main() -> None:
         print(f"\n{Fore.YELLOW}Exiting...{Style.RESET_ALL}")
     finally:
         shutdown_event.set()  # Ensure all threads know to stop
+        ser.close()
         plt.close("all")  # Force close any lingering plot windows
 
 

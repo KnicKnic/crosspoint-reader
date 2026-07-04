@@ -237,6 +237,7 @@ static bool loadSleepFrameBuffer() {
 void enterDeepSleep(bool fromTimeout = false) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+  APP_STATE.lastSleepFromCompanion = activityManager.isCompanionActivity();
 
   const bool isQuickResumeSleep =
       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
@@ -304,17 +305,7 @@ void setupDisplayAndFonts(bool seamless = false) {
 
 void setup() {
   t1 = millis();
-
-#ifdef ENABLE_SERIAL_LOG
-  // Earliest possible Serial setup. The 250 ms stall before begin() lets the
-  // USB Serial/JTAG peripheral finish power-on and lets the host complete USB
-  // enumeration before we touch the CDC state — otherwise cold boot races
-  // and the host has to be physically replugged for logs to flow. Warm reboot
-  // worked without the delay because USB was already enumerated.
-  delay(250);
-  Serial.begin(115200);
-  logSerial.setTxTimeoutMs(1);  // This is a load-bearing 1. Do not modify.
-#endif
+  setSerialLogOutputEnabled(false);
 
   HalSystem::begin();
 
@@ -345,6 +336,18 @@ void setup() {
   HalSystem::checkPanic();
 
   SETTINGS.loadFromFile();
+  setSerialLogOutputEnabled(SETTINGS.serialLoggingEnabled != 0);
+#ifdef ENABLE_SERIAL_LOG
+  if (SETTINGS.serialLoggingEnabled) {
+    delay(250);
+    Serial.begin(115200);
+    logSerial.setTxTimeoutMs(1);  // This is a load-bearing 1. Do not modify.
+    const unsigned long serialStart = millis();
+    while (!Serial && (millis() - serialStart) < 500) {
+      delay(10);
+    }
+  }
+#endif
   APP_STATE.loadFromFile();
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
@@ -436,6 +439,16 @@ void setup() {
   } else if (HalSystem::isRebootFromPanic()) {
     // If we rebooted from a panic, go to crash report screen to show the panic info
     activityManager.goToCrashReport();
+  } else if (APP_STATE.lastSleepFromCompanion) {
+    APP_STATE.lastSleepFromCompanion = false;
+    APP_STATE.lastSleepFromReader = false;
+    APP_STATE.saveToFile();
+
+    if (mappedInputManager.isPressed(MappedInputManager::Button::Back)) {
+      activityManager.goHome();
+    } else {
+      activityManager.goToLaptopCompanion();
+    }
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
              !APP_STATE.openEpubPath.empty()) {
     activityManager.goToReader(APP_STATE.openEpubPath);
@@ -489,8 +502,9 @@ void loop() {
   halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, activityManager.isReaderActivity());
 
   renderer.setFadingFix(SETTINGS.fadingFix);
+  const bool activityOwnsPowerManagement = activityManager.ownsPowerManagement();
 
-  if (Serial && millis() - lastMemPrint >= 10000) {
+  if (SETTINGS.serialLoggingEnabled && isSerialLogOutputEnabled() && Serial && millis() - lastMemPrint >= 10000) {
     LOG_INF("MEM", "Free: %d bytes, Total: %d bytes, Min Free: %d bytes, MaxAlloc: %d bytes", ESP.getFreeHeap(),
             ESP.getHeapSize(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
     lastMemPrint = millis();
@@ -498,7 +512,7 @@ void loop() {
 
   // Handle incoming serial commands,
   // nb: we use logSerial from logging to avoid deprecation warnings
-  if (logSerial.available() > 0) {
+  if (SETTINGS.serialLoggingEnabled && isSerialLogOutputEnabled() && logSerial.available() > 0) {
     String line = logSerial.readStringUntil('\n');
     if (line.startsWith("CMD:")) {
       String cmd = line.substring(4);
@@ -517,8 +531,10 @@ void loop() {
   static unsigned long lastActivityTime = millis();
   if (gpio.wasAnyPressed() || gpio.wasAnyReleased() || halTiltSensor.hadActivity() ||
       activityManager.preventAutoSleep()) {
-    lastActivityTime = millis();         // Reset inactivity timer
-    powerManager.setPowerSaving(false);  // Restore normal CPU frequency on user activity
+    lastActivityTime = millis();  // Reset inactivity timer
+    if (!activityOwnsPowerManagement) {
+      powerManager.setPowerSaving(false);  // Restore normal CPU frequency on user activity
+    }
   }
 
   static bool screenshotButtonsReleased = true;
@@ -546,7 +562,7 @@ void loop() {
   }
 
   const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
-  if (sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
+  if (!activityOwnsPowerManagement && sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
     LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
     enterDeepSleep(true);
     // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
@@ -593,7 +609,9 @@ void loop() {
   // Add delay at the end of the loop to prevent tight spinning
   // When an activity requests skip loop delay (e.g., webserver running), use yield() for faster response
   // Otherwise, use longer delay to save power
-  if (activityManager.skipLoopDelay()) {
+  if (activityOwnsPowerManagement) {
+    yield();
+  } else if (activityManager.skipLoopDelay()) {
     powerManager.setPowerSaving(false);  // Make sure we're at full performance when skipLoopDelay is requested
     yield();                             // Give FreeRTOS a chance to run tasks, but return immediately
   } else {

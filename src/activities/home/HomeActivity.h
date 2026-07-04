@@ -33,6 +33,8 @@ class HomeActivity final : public Activity {
   // Convert HomeMenuItem to menu index (used in onEnter)
   static int menuItemToIndex(HomeMenuItem item, bool hasOpdsUrl) {
     int i = 0;
+    if (item == HomeMenuItem::LAPTOP_COMPANION) return i;
+    ++i;
     if (item == HomeMenuItem::FILE_BROWSER) return i;
     ++i;
     if (item == HomeMenuItem::RECENTS) return i;
@@ -48,6 +50,7 @@ class HomeActivity final : public Activity {
   // Convert menu index to HomeMenuItem (used in loop)
   static HomeMenuItem indexToMenuItem(int idx, bool hasOpdsUrl) {
     int i = 0;
+    if (idx == i++) return HomeMenuItem::LAPTOP_COMPANION;
     if (idx == i++) return HomeMenuItem::FILE_BROWSER;
     if (idx == i++) return HomeMenuItem::RECENTS;
     if (hasOpdsUrl && idx == i++) return HomeMenuItem::OPDS_BROWSER;
@@ -60,6 +63,7 @@ class HomeActivity final : public Activity {
   void onRecentsOpen();
   void onSettingsOpen();
   void onFileTransferOpen();
+  void onLaptopCompanionOpen();
   void onOpdsBrowserOpen();
 
   int getMenuItemCount() const;

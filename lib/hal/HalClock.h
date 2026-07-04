@@ -12,6 +12,10 @@ class HalClock {
   bool _available = false;
   mutable uint8_t _cachedHour = 0;
   mutable uint8_t _cachedMinute = 0;
+  mutable uint8_t _cachedSecond = 0;
+  mutable uint16_t _cachedYear = 2000;
+  mutable uint8_t _cachedMonth = 1;
+  mutable uint8_t _cachedDay = 1;
   mutable bool _hasCachedTime = false;
   mutable unsigned long _lastPollMs = 0;
 
@@ -27,13 +31,22 @@ class HalClock {
   // Get current hour (0-23) and minute (0-59).
   // Returns false if RTC is not available.
   bool getTime(uint8_t& hour, uint8_t& minute) const;
+  bool getTime(uint8_t& hour, uint8_t& minute, uint8_t& second) const;
+
+  // Get current UTC date from the RTC.
+  // Returns false if RTC is not available.
+  bool getDate(uint16_t& year, uint8_t& month, uint8_t& day) const;
 
   // Format time into a caller-provided buffer.
   // 24h mode produces "HH:MM" (needs >=6 bytes); 12h mode produces "H:MM AM"/"HH:MM PM" (needs >=9 bytes).
   // utcOffsetQuarterHoursBiased: biased quarter-hour offset (48 = UTC+0, 0 = UTC-12, 104 = UTC+14).
   // use12Hour: when true, format as 12-hour clock with AM/PM suffix.
   // Returns false if RTC is not available.
-  bool formatTime(char* buf, size_t bufSize, uint8_t utcOffsetQuarterHoursBiased = 48, bool use12Hour = false) const;
+  bool formatTime(char* buf, size_t bufSize, uint8_t utcOffsetQuarterHoursBiased = 48, bool use12Hour = false,
+                  bool includeSeconds = false) const;
+
+  // Format date as "YYYY-MM-DD" into a caller-provided buffer (needs >=11 bytes).
+  bool formatDate(char* buf, size_t bufSize) const;
 
   // Sync the DS3231 RTC from an NTP server. Requires WiFi to be connected.
   // Blocks for up to ~5s while waiting for SNTP response.
@@ -44,5 +57,7 @@ class HalClock {
   bool syncFromNTP();
 
  private:
-  bool writeTimeToRTC(uint8_t hour, uint8_t minute, uint8_t second);
+  bool readDateTimeFromRTC() const;
+  bool writeDateTimeToRTC(uint16_t year, uint8_t month, uint8_t day, uint8_t weekday, uint8_t hour, uint8_t minute,
+                          uint8_t second);
 };

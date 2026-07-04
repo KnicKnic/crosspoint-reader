@@ -168,6 +168,25 @@ git submodule update --init --recursive
 pio run --target upload
 ```
 
+On Windows, build the default firmware image with:
+
+```powershell
+.\scripts\build_x3_windows.ps1
+```
+
+The output image is written to `.pio/build/default/firmware.bin`.
+
+Build and flash it with:
+
+```powershell
+.\scripts\flash_x3_windows.ps1 -Build
+```
+
+The Windows helpers set UTF-8 output and prefer PlatformIO's own virtualenv
+executable, which avoids Python/PATH issues with PlatformIO dependencies. Pass
+`-Environment gh_release` to build a release image, or `-Port COM3` when more
+than one candidate ESP32-C3 serial port is connected.
+
 ### Contributor pre-PR checks
 
 ```bash

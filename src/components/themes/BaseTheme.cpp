@@ -665,9 +665,39 @@ void BaseTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const std:
 void BaseTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
                                const std::function<std::string(int index)>& buttonLabel,
                                const std::function<UIIcon(int index)>& rowIcon) const {
-  for (int i = 0; i < buttonCount; ++i) {
+  (void)rowIcon;
+  const int rowStep = BaseMetrics::values.menuRowHeight + BaseMetrics::values.menuSpacing;
+  const int pageItems = std::max(1, (rect.height - BaseMetrics::values.verticalSpacing) / rowStep);
+  const int safeSelectedIndex = selectedIndex < 0 ? 0 : std::min(selectedIndex, buttonCount - 1);
+  const int pageStartIndex = (safeSelectedIndex / pageItems) * pageItems;
+  const int pageEndIndex = std::min(buttonCount, pageStartIndex + pageItems);
+
+  if (buttonCount > pageItems) {
+    constexpr int indicatorWidth = 20;
+    constexpr int arrowSize = 6;
+    constexpr int margin = 15;
+
+    const int centerX = rect.x + rect.width - indicatorWidth / 2 - margin;
+    const int indicatorTop = rect.y + BaseMetrics::values.verticalSpacing;
+    const int indicatorBottom = rect.y + rect.height - arrowSize;
+
+    for (int i = 0; i < arrowSize; ++i) {
+      const int lineWidth = 1 + i * 2;
+      const int startX = centerX - i;
+      renderer.drawLine(startX, indicatorTop + i, startX + lineWidth - 1, indicatorTop + i);
+    }
+
+    for (int i = 0; i < arrowSize; ++i) {
+      const int lineWidth = 1 + (arrowSize - 1 - i) * 2;
+      const int startX = centerX - (arrowSize - 1 - i);
+      renderer.drawLine(startX, indicatorBottom - arrowSize + 1 + i, startX + lineWidth - 1,
+                        indicatorBottom - arrowSize + 1 + i);
+    }
+  }
+
+  for (int i = pageStartIndex; i < pageEndIndex; ++i) {
     const int tileY = BaseMetrics::values.verticalSpacing + rect.y +
-                      static_cast<int>(i) * (BaseMetrics::values.menuRowHeight + BaseMetrics::values.menuSpacing);
+                      static_cast<int>(i - pageStartIndex) * rowStep;
 
     const bool selected = selectedIndex == i;
 

@@ -4,8 +4,20 @@
 // values that fail the check. Safe to skip: the eFuse block revision gate is
 // a manufacturing concern, not a runtime safety issue.
 #include <esp_err.h>
+#include <stdarg.h>
+
 esp_err_t __wrap_bootloader_common_check_efuse_blk_validity(uint32_t min_rev_full, uint32_t max_rev_full) {
   (void)min_rev_full;
   (void)max_rev_full;
   return ESP_OK;
+}
+
+int log_printfv(const char *format, va_list arg);
+
+int __wrap_log_printf(const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  int result = log_printfv(format, args);
+  va_end(args);
+  return result;
 }

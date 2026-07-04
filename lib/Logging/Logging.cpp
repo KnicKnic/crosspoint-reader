@@ -15,6 +15,11 @@ RTC_NOINIT_ATTR size_t logHead = 0;
 // never properly initialized.
 RTC_NOINIT_ATTR uint32_t rtcLogMagic;
 static constexpr uint32_t LOG_RTC_MAGIC = 0xDEADBEEF;
+static bool serialLogOutputEnabled = true;
+
+void setSerialLogOutputEnabled(bool enabled) { serialLogOutputEnabled = enabled; }
+
+bool isSerialLogOutputEnabled() { return serialLogOutputEnabled; }
 
 void addToLogRingBuffer(const char* message) {
   // Add the message to the ring buffer, overwriting old messages if necessary.
@@ -59,7 +64,7 @@ void logPrintf(const char* level, const char* origin, const char* format, ...) {
     }
   }
   va_end(args);
-  if (logSerial) {
+  if (serialLogOutputEnabled && logSerial) {
     logSerial.print(buf);
   }
   addToLogRingBuffer(buf);

@@ -30,6 +30,8 @@ won't trigger deprecation warnings.
 static HWCDC& logSerial = Serial;
 
 void logPrintf(const char* level, const char* origin, const char* format, ...);
+void setSerialLogOutputEnabled(bool enabled);
+bool isSerialLogOutputEnabled();
 
 #ifdef ENABLE_SERIAL_LOG
 #if LOG_LEVEL >= 0

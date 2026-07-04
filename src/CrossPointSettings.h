@@ -268,6 +268,8 @@ class CrossPointSettings {
   uint8_t language = 0;
   // Quick Resume: keep current content visible with moon icon instead of showing a static sleep screen.
   uint8_t quickResumeSleepScreen = QUICK_RESUME_NEVER;
+  // Runtime USB serial log output. Disabled by default; enable from Settings > System.
+  uint8_t serialLoggingEnabled = 0;
 
   ~CrossPointSettings() = default;
 

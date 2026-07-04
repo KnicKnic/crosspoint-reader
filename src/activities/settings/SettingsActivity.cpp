@@ -1,5 +1,6 @@
 #include "SettingsActivity.h"
 
+#include <Arduino.h>
 #include <GfxRenderer.h>
 #include <Logging.h>
 
@@ -12,6 +13,7 @@
 #include "CrossPointSettings.h"
 #include "FontDownloadActivity.h"
 #include "FontSelectionActivity.h"
+#include "HardwareTestActivity.h"
 #include "KOReaderSettingsActivity.h"
 #include "LanguageSelectActivity.h"
 #include "MappedInputManager.h"
@@ -21,6 +23,7 @@
 #include "SdFirmwareUpdateActivity.h"
 #include "SettingsList.h"
 #include "StatusBarSettingsActivity.h"
+#include "BatteryDrainActivity.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "activities/util/IntervalSelectionActivity.h"
 #include "components/UITheme.h"
@@ -65,6 +68,8 @@ void SettingsActivity::rebuildSettingsLists() {
   systemSettings.push_back(SettingInfo::Action(StrId::STR_CLEAR_READING_CACHE, SettingAction::ClearCache));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
+  systemSettings.push_back(SettingInfo::Action(StrId::STR_HARDWARE_TEST, SettingAction::HardwareTest));
+  systemSettings.push_back(SettingInfo::Action(StrId::STR_BATTERY_DRAIN, SettingAction::BatteryDrain));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_LANGUAGE, SettingAction::Language));
   // Insert "Manage Fonts" right after the font family setting so users discover it naturally
   readerSettings.insert(readerSettings.begin() + 1,
@@ -201,6 +206,22 @@ void SettingsActivity::toggleCurrentSetting() {
     // Toggle the boolean value using the member pointer
     const bool currentValue = SETTINGS.*(setting.valuePtr);
     SETTINGS.*(setting.valuePtr) = !currentValue;
+    if (setting.nameId == StrId::STR_SERIAL_LOGGING) {
+      setSerialLogOutputEnabled(SETTINGS.serialLoggingEnabled != 0);
+#ifdef ENABLE_SERIAL_LOG
+      if (SETTINGS.serialLoggingEnabled) {
+        Serial.begin(115200);
+        logSerial.setTxTimeoutMs(1);
+        const unsigned long start = millis();
+        while (!Serial && (millis() - start) < 500) {
+          delay(10);
+        }
+      } else {
+        logSerial.flush();
+        logSerial.end();
+      }
+#endif
+    }
   } else if (setting.type == SettingType::ENUM && setting.valuePtr != nullptr) {
     const uint8_t currentValue = SETTINGS.*(setting.valuePtr);
     SETTINGS.*(setting.valuePtr) = (currentValue + 1) % static_cast<uint8_t>(setting.enumValues.size());
@@ -260,6 +281,12 @@ void SettingsActivity::toggleCurrentSetting() {
                                  SETTINGS.saveToFile();
                                  rebuildSettingsLists();
                                });
+        break;
+      case SettingAction::HardwareTest:
+        startActivityForResult(std::make_unique<HardwareTestActivity>(renderer, mappedInput), resultHandler);
+        break;
+      case SettingAction::BatteryDrain:
+        startActivityForResult(std::make_unique<BatteryDrainActivity>(renderer, mappedInput), resultHandler);
         break;
       case SettingAction::Language:
         startActivityForResult(std::make_unique<LanguageSelectActivity>(renderer, mappedInput), resultHandler);

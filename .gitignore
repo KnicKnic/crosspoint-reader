@@ -9,6 +9,8 @@ lib/I18n/I18nStrings.cpp
 *.generated.h
 .vs
 build
+[Bb]in/
+[Oo]bj/
 **/__pycache__/
 /compile_commands.json
 /.cache
@@ -16,6 +18,12 @@ build
 /.venv
 *.local*
 *.cpfont
+/.dummy/
+/CMakeLists.txt
+/dependencies.lock
+/managed_components/
+/sdkconfig.default
+/sdkconfig.defaults
 lib/EpdFont/scripts/downloaded_fonts/
 lib/EpdFont/scripts/instanced_fonts/
 lib/EpdFont/scripts/output/
