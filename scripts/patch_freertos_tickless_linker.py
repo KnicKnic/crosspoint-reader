@@ -31,17 +31,32 @@ def patch_freertos_tickless_linker():
 
     text = sections_path.read_text(encoding="utf-8")
     if ".text.prvGetExpectedIdleTime" in text and ".text.vTaskStepTick" in text:
-        return
+        patched_tickless = True
+    else:
+        patched_tickless = False
 
-    marker = "    *libfreertos.a:tasks.*(.literal.xTaskGetNext .text.xTaskGetNext)\n"
-    if marker not in text:
-        raise RuntimeError(
-            "ESP32-C3 sections.ld did not contain expected FreeRTOS tasks marker"
-        )
+    if not patched_tickless:
+        marker = "    *libfreertos.a:tasks.*(.literal.xTaskGetNext .text.xTaskGetNext)\n"
+        if marker not in text:
+            raise RuntimeError(
+                "ESP32-C3 sections.ld did not contain expected FreeRTOS tasks marker"
+            )
 
-    replacement = marker + "\n".join(PATCH_LINES) + "\n"
-    sections_path.write_text(text.replace(marker, replacement, 1), encoding="utf-8")
-    print("Patched ESP32-C3 FreeRTOS tickless linker sections")
+        replacement = marker + "\n".join(PATCH_LINES) + "\n"
+        text = text.replace(marker, replacement, 1)
+        print("Patched ESP32-C3 FreeRTOS tickless linker sections")
+
+    if ".text.handler_execute" not in text:
+        marker = ".text.handler_instances_add"
+        if marker not in text:
+            raise RuntimeError(
+                "ESP32-C3 sections.ld did not contain expected esp_event marker"
+            )
+        text = text.replace(marker, ".text.handler_execute " + marker, 1)
+        print("Patched ESP32-C3 esp_event handler_execute linker section")
+
+    if text != sections_path.read_text(encoding="utf-8"):
+        sections_path.write_text(text, encoding="utf-8")
 
 
 patch_freertos_tickless_linker()

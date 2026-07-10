@@ -1,5 +1,9 @@
 #include "Logging.h"
 
+#include <algorithm>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
 #include <string>
 
 #define MAX_ENTRY_LEN 256
@@ -16,6 +20,70 @@ RTC_NOINIT_ATTR size_t logHead = 0;
 RTC_NOINIT_ATTR uint32_t rtcLogMagic;
 static constexpr uint32_t LOG_RTC_MAGIC = 0xDEADBEEF;
 static bool serialLogOutputEnabled = true;
+
+namespace {
+
+constexpr size_t RAW_STDIO_BUFFER_LEN = 512;
+
+void writeRawStdioPrefix() {
+  char prefix[40];
+  const int len = snprintf(prefix, sizeof(prefix), "[%lu] [DBG] [STDIO] ", millis());
+  if (len > 0) {
+    logSerial.write(reinterpret_cast<const uint8_t*>(prefix), std::min(static_cast<size_t>(len), sizeof(prefix) - 1));
+  }
+}
+
+void writeRawStdioWithPrefix(const char* message, size_t length) {
+  if (!serialLogOutputEnabled || !logSerial || message == nullptr || length == 0) return;
+
+  static bool atLineStart = true;
+  size_t offset = 0;
+  while (offset < length) {
+    if (atLineStart) {
+      writeRawStdioPrefix();
+      atLineStart = false;
+    }
+
+    size_t chunkEnd = offset;
+    while (chunkEnd < length && message[chunkEnd] != '\n') {
+      chunkEnd++;
+    }
+
+    if (chunkEnd > offset) {
+      logSerial.write(reinterpret_cast<const uint8_t*>(message + offset), chunkEnd - offset);
+    }
+
+    if (chunkEnd < length && message[chunkEnd] == '\n') {
+      logSerial.write(static_cast<uint8_t>('\n'));
+      atLineStart = true;
+      chunkEnd++;
+    }
+
+    offset = chunkEnd;
+  }
+}
+
+int rawStdioVprintf(const char* format, va_list args) {
+  char buffer[RAW_STDIO_BUFFER_LEN];
+  const int len = vsnprintf(buffer, sizeof(buffer), format, args);
+  if (len < 0) return len;
+
+  const size_t writeLength = std::min(static_cast<size_t>(len), sizeof(buffer) - 1);
+  writeRawStdioWithPrefix(buffer, writeLength);
+  return len;
+}
+
+}  // namespace
+
+extern "C" int __wrap_printf(const char* format, ...) {
+  va_list args;
+  va_start(args, format);
+  const int result = rawStdioVprintf(format, args);
+  va_end(args);
+  return result;
+}
+
+extern "C" int __wrap_vprintf(const char* format, va_list args) { return rawStdioVprintf(format, args); }
 
 void setSerialLogOutputEnabled(bool enabled) {
 #ifdef ENABLE_SERIAL_LOG

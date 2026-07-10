@@ -6,8 +6,10 @@
 #include <Logging.h>
 #include <NimBLEDevice.h>
 #include <NimBLEUtils.h>
+#include <PmLockTrace.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -28,10 +30,10 @@ constexpr uint16_t BLE_CONN_INTERVAL_RESPONSIVE_MAX = 40;  // 50 ms
 constexpr uint16_t BLE_CONN_LATENCY_RESPONSIVE = 0;
 constexpr uint16_t BLE_CONN_TIMEOUT_RESPONSIVE = 400;      // 4 s
 
-constexpr uint16_t BLE_CONN_INTERVAL_IDLE_MIN = 240;       // 300 ms
-constexpr uint16_t BLE_CONN_INTERVAL_IDLE_MAX = 400;       // 500 ms
-constexpr uint16_t BLE_CONN_LATENCY_IDLE = 2;
-constexpr uint16_t BLE_CONN_TIMEOUT_IDLE = 1000;           // 10 s
+constexpr uint16_t BLE_CONN_INTERVAL_IDLE_MIN = 80;        // 100 ms
+constexpr uint16_t BLE_CONN_INTERVAL_IDLE_MAX = 96;        // 120 ms
+constexpr uint16_t BLE_CONN_LATENCY_IDLE = 39;             // Up to 4-4.8 s between idle radio events.
+constexpr uint16_t BLE_CONN_TIMEOUT_IDLE = 1500;           // 15 s
 constexpr uint16_t BLE_ADV_INTERVAL_LOW_POWER_MIN = 800;   // 500 ms
 constexpr uint16_t BLE_ADV_INTERVAL_LOW_POWER_MAX = 1600;  // 1000 ms
 
@@ -67,7 +69,28 @@ const char* profileName(CompanionBleService::ConnectionPowerProfile profile) {
   }
 }
 
+uint32_t connIntervalTenthsMs(uint16_t interval) {
+  return (static_cast<uint32_t>(interval) * 125U + 5U) / 10U;
+}
+
+uint32_t advIntervalTenthsMs(uint16_t interval) {
+  return (static_cast<uint32_t>(interval) * 625U + 50U) / 100U;
+}
+
+void formatTenthsMs(uint32_t tenthsMs, char* buffer, size_t bufferSize) {
+  if (tenthsMs % 10U == 0) {
+    snprintf(buffer, bufferSize, "%lums", static_cast<unsigned long>(tenthsMs / 10U));
+    return;
+  }
+  snprintf(buffer, bufferSize, "%lu.%lums", static_cast<unsigned long>(tenthsMs / 10U),
+           static_cast<unsigned long>(tenthsMs % 10U));
+}
+
 CompanionBleService* g_service = nullptr;
+
+uint32_t deltaCounter(uint32_t current, uint32_t previous) {
+  return current >= previous ? current - previous : 0;
+}
 
 class CompanionServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
@@ -79,6 +102,7 @@ class CompanionServerCallbacks : public NimBLEServerCallbacks {
                                   static_cast<unsigned>(connInfo.getConnHandle()));
     if (g_service) {
       g_service->onHostConnected(connInfo.getConnHandle());
+      g_service->onConnParamsUpdated(connInfo.getConnInterval(), connInfo.getConnLatency(), connInfo.getConnTimeout());
     }
   }
 
@@ -107,6 +131,40 @@ class CompanionServerCallbacks : public NimBLEServerCallbacks {
                                      connInfo.getConnTimeout());
     }
   }
+
+  void onMTUChange(uint16_t mtu, NimBLEConnInfo& connInfo) override {
+    LOG_INF("COMP", "Host MTU changed address=%s handle=%u mtu=%u interval=%.1f ms latency=%u timeout=%u ms",
+            connInfo.getAddress().toString().c_str(), static_cast<unsigned>(connInfo.getConnHandle()),
+            static_cast<unsigned>(mtu), connInfo.getConnInterval() * 1.25f,
+            static_cast<unsigned>(connInfo.getConnLatency()), static_cast<unsigned>(connInfo.getConnTimeout() * 10));
+    BluetoothDiagnostics::recordf("companion_host_mtu_changed", "handle=%u mtu=%u",
+                                  static_cast<unsigned>(connInfo.getConnHandle()), static_cast<unsigned>(mtu));
+  }
+
+  void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
+    LOG_INF("COMP", "Host auth complete handle=%u bonded=%d enc=%d auth=%d key=%u",
+            static_cast<unsigned>(connInfo.getConnHandle()), connInfo.isBonded(), connInfo.isEncrypted(),
+            connInfo.isAuthenticated(), static_cast<unsigned>(connInfo.getSecKeySize()));
+    BluetoothDiagnostics::recordf("companion_host_auth_complete", "handle=%u bonded=%d enc=%d auth=%d",
+                                  static_cast<unsigned>(connInfo.getConnHandle()), connInfo.isBonded(),
+                                  connInfo.isEncrypted(), connInfo.isAuthenticated());
+  }
+
+  void onIdentity(NimBLEConnInfo& connInfo) override {
+    LOG_INF("COMP", "Host identity resolved handle=%u addr=%s id=%s",
+            static_cast<unsigned>(connInfo.getConnHandle()), connInfo.getAddress().toString().c_str(),
+            connInfo.getIdAddress().toString().c_str());
+    BluetoothDiagnostics::recordf("companion_host_identity", "handle=%u",
+                                  static_cast<unsigned>(connInfo.getConnHandle()));
+  }
+
+  void onPhyUpdate(NimBLEConnInfo& connInfo, uint8_t txPhy, uint8_t rxPhy) override {
+    LOG_INF("COMP", "Host PHY update handle=%u tx=%u rx=%u", static_cast<unsigned>(connInfo.getConnHandle()),
+            static_cast<unsigned>(txPhy), static_cast<unsigned>(rxPhy));
+    BluetoothDiagnostics::recordf("companion_host_phy_update", "handle=%u tx=%u rx=%u",
+                                  static_cast<unsigned>(connInfo.getConnHandle()), static_cast<unsigned>(txPhy),
+                                  static_cast<unsigned>(rxPhy));
+  }
 };
 
 class HostStateCallbacks : public NimBLECharacteristicCallbacks {
@@ -116,6 +174,10 @@ class HostStateCallbacks : public NimBLECharacteristicCallbacks {
  private:
   void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& connInfo) override {
     const size_t len = characteristic ? characteristic->getValue().size() : 0;
+    LOG_INF("COMP", "Host write field=%s handle=%u len=%u interval=%.1f ms latency=%u timeout=%u ms",
+            hostStateFieldName(field), static_cast<unsigned>(connInfo.getConnHandle()), static_cast<unsigned>(len),
+            connInfo.getConnInterval() * 1.25f, static_cast<unsigned>(connInfo.getConnLatency()),
+            static_cast<unsigned>(connInfo.getConnTimeout() * 10));
     BluetoothDiagnostics::recordf("companion_host_state_write", "field=%s handle=%u len=%u",
                                   hostStateFieldName(field), static_cast<unsigned>(connInfo.getConnHandle()),
                                   static_cast<unsigned>(len));
@@ -143,6 +205,14 @@ class HostStateCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 class ButtonEventCallbacks : public NimBLECharacteristicCallbacks {
+  void onStatus(NimBLECharacteristic* characteristic, NimBLEConnInfo& connInfo, int code) override {
+    (void)characteristic;
+    LOG_INF("COMP", "Button notify tx status handle=%u code=%d %s", static_cast<unsigned>(connInfo.getConnHandle()),
+            code, NimBLEUtils::returnCodeToString(code));
+    BluetoothDiagnostics::recordf("companion_button_event_notify_status", "handle=%u code=%d",
+                                  static_cast<unsigned>(connInfo.getConnHandle()), code);
+  }
+
   void onSubscribe(NimBLECharacteristic* characteristic, NimBLEConnInfo& connInfo, uint16_t subValue) override {
     (void)characteristic;
     LOG_INF("COMP", "Button event subscription changed address=%s handle=%u sub=%u",
@@ -378,6 +448,15 @@ void CompanionBleService::resetSessionState() {
   hostStateReceived = false;
   buttonEventSubscribed = false;
   connectionProfile = ConnectionPowerProfile::Unknown;
+  requestedConnectionProfile = ConnectionPowerProfile::Unknown;
+  requestedConnIntervalMin = 0;
+  requestedConnIntervalMax = 0;
+  requestedConnLatency = 0;
+  requestedConnTimeout = 0;
+  negotiatedConnInterval = 0;
+  negotiatedConnLatency = 0;
+  negotiatedConnTimeout = 0;
+  hasNegotiatedConnParams = false;
   lastConnParamRequestAtMs = 0;
   responsiveUntilMs = 0;
   buttonEventSequence = 0;
@@ -405,6 +484,7 @@ void CompanionBleService::update() {
     return;
   }
 
+  activityStats.updateCalls++;
   const unsigned long now = millis();
   const bool pendingRestartDue =
       advertisingRestartPending && static_cast<long>(now - pendingAdvertisingRestartAtMs) >= 0;
@@ -412,6 +492,7 @@ void CompanionBleService::update() {
     return;
   }
   lastMaintenanceAtMs = now;
+  activityStats.maintenanceRuns++;
 
   const bool hasPeers = hasConnectedHosts();
   if (advertisingRestartPending && static_cast<long>(now - pendingAdvertisingRestartAtMs) >= 0) {
@@ -484,6 +565,83 @@ bool CompanionBleService::notifyToggleMuteReleased() {
   return true;
 }
 
+std::string CompanionBleService::formatTimingDiagnostics() const {
+  char advMin[12];
+  char advMax[12];
+  char prefMin[12];
+  char prefMax[12];
+  formatTenthsMs(advIntervalTenthsMs(BLE_ADV_INTERVAL_LOW_POWER_MIN), advMin, sizeof(advMin));
+  formatTenthsMs(advIntervalTenthsMs(BLE_ADV_INTERVAL_LOW_POWER_MAX), advMax, sizeof(advMax));
+  formatTenthsMs(connIntervalTenthsMs(BLE_CONN_INTERVAL_IDLE_MIN), prefMin, sizeof(prefMin));
+  formatTenthsMs(connIntervalTenthsMs(BLE_CONN_INTERVAL_IDLE_MAX), prefMax, sizeof(prefMax));
+
+  char line[144];
+  const bool advertising = running && !hostConnected && NimBLEDevice::getAdvertising() &&
+                           NimBLEDevice::getAdvertising()->isAdvertising();
+  snprintf(line, sizeof(line), "BLEA: adv %s-%s pref %s-%s %s", advMin, advMax, prefMin, prefMax,
+           advertising ? "on" : "off");
+
+  std::string result(line);
+  result += "\n";
+
+  char reqMin[12] = "?";
+  char reqMax[12] = "?";
+  if (requestedConnIntervalMin != 0 && requestedConnIntervalMax != 0) {
+    formatTenthsMs(connIntervalTenthsMs(requestedConnIntervalMin), reqMin, sizeof(reqMin));
+    formatTenthsMs(connIntervalTenthsMs(requestedConnIntervalMax), reqMax, sizeof(reqMax));
+  }
+
+  if (hostConnected && hasNegotiatedConnParams) {
+    char got[12];
+    formatTenthsMs(connIntervalTenthsMs(negotiatedConnInterval), got, sizeof(got));
+    snprintf(line, sizeof(line), "BLEC: got %s L%u T%us req %s %s-%s L%u T%us", got,
+             static_cast<unsigned>(negotiatedConnLatency), static_cast<unsigned>(negotiatedConnTimeout / 100U),
+             profileName(requestedConnectionProfile), reqMin, reqMax, static_cast<unsigned>(requestedConnLatency),
+             static_cast<unsigned>(requestedConnTimeout / 100U));
+  } else if (hostConnected) {
+    snprintf(line, sizeof(line), "BLEC: pending req %s %s-%s L%u T%us", profileName(requestedConnectionProfile),
+             reqMin, reqMax, static_cast<unsigned>(requestedConnLatency),
+             static_cast<unsigned>(requestedConnTimeout / 100U));
+  } else {
+    snprintf(line, sizeof(line), "BLEC: disc req %s %s-%s L%u T%us", profileName(requestedConnectionProfile), reqMin,
+             reqMax, static_cast<unsigned>(requestedConnLatency),
+             static_cast<unsigned>(requestedConnTimeout / 100U));
+  }
+  result += line;
+  return result;
+}
+
+std::string CompanionBleService::formatActivityDeltaDiagnostics() {
+  if (!hasPreviousActivityStats) {
+    previousActivityStats = activityStats;
+    hasPreviousActivityStats = true;
+    return "BLED: baseline";
+  }
+
+  const ActivityStats current = activityStats;
+  char line[176];
+  snprintf(line, sizeof(line),
+           "BLED: upd+%lu m+%lu wr+%lu chg+%lu sub+%lu ntf+%lu req+%lu got+%lu adv+%lu gap+%lu/%lu st+%lu",
+           static_cast<unsigned long>(deltaCounter(current.updateCalls, previousActivityStats.updateCalls)),
+           static_cast<unsigned long>(deltaCounter(current.maintenanceRuns, previousActivityStats.maintenanceRuns)),
+           static_cast<unsigned long>(deltaCounter(current.hostWrites, previousActivityStats.hostWrites)),
+           static_cast<unsigned long>(deltaCounter(current.hostStateChanges, previousActivityStats.hostStateChanges)),
+           static_cast<unsigned long>(deltaCounter(current.buttonSubscribes, previousActivityStats.buttonSubscribes)),
+           static_cast<unsigned long>(deltaCounter(current.buttonNotifications,
+                                                   previousActivityStats.buttonNotifications)),
+           static_cast<unsigned long>(deltaCounter(current.connParamRequests,
+                                                   previousActivityStats.connParamRequests)),
+           static_cast<unsigned long>(deltaCounter(current.connParamUpdates, previousActivityStats.connParamUpdates)),
+           static_cast<unsigned long>(deltaCounter(current.advertisingRestarts,
+                                                   previousActivityStats.advertisingRestarts)),
+           static_cast<unsigned long>(deltaCounter(current.gapConnects, previousActivityStats.gapConnects)),
+           static_cast<unsigned long>(deltaCounter(current.gapDisconnects, previousActivityStats.gapDisconnects)),
+           static_cast<unsigned long>(deltaCounter(current.statusNotifications,
+                                                   previousActivityStats.statusNotifications)));
+  previousActivityStats = current;
+  return line;
+}
+
 void CompanionBleService::setStatusChangedCallback(std::function<void()> callback) {
   statusChangedCallback = std::move(callback);
 }
@@ -501,6 +659,7 @@ void CompanionBleService::onHostConnected(uint16_t connHandle) {
   hostConnHandle = connHandle;
   hostConnectedAtMs = millis();
   statusChanged = true;
+  activityStats.gapConnects++;
   BluetoothDiagnostics::record("companion_host_connected");
   LOG_INF("COMP", "Host connected to companion BLE GATT server");
   requestConnectionParams(ConnectionPowerProfile::Responsive, "connect");
@@ -512,6 +671,7 @@ void CompanionBleService::onHostDisconnected() {
   resetSessionState();
   publishHostStateValues();
   statusChanged = true;
+  activityStats.gapDisconnects++;
   BluetoothDiagnostics::record("companion_host_disconnected");
   LOG_INF("COMP", "Host disconnected; host state reset to defaults");
   logStateSnapshot("disconnect");
@@ -531,6 +691,12 @@ void CompanionBleService::scheduleAdvertisingRestart(const char* reason, unsigne
 }
 
 void CompanionBleService::onConnParamsUpdated(uint16_t interval, uint16_t latency, uint16_t timeout) {
+  activityStats.connParamUpdates++;
+  negotiatedConnInterval = interval;
+  negotiatedConnLatency = latency;
+  negotiatedConnTimeout = timeout;
+  setBtLockTraceConnectionParams(interval, latency);
+  hasNegotiatedConnParams = true;
   if (interval >= BLE_CONN_INTERVAL_IDLE_MIN && interval <= BLE_CONN_INTERVAL_IDLE_MAX &&
       latency >= BLE_CONN_LATENCY_IDLE && timeout >= BLE_CONN_TIMEOUT_IDLE) {
     connectionProfile = ConnectionPowerProfile::Idle;
@@ -540,6 +706,7 @@ void CompanionBleService::onConnParamsUpdated(uint16_t interval, uint16_t latenc
 }
 
 void CompanionBleService::onHostTeamsStateWritten(NimBLECharacteristic* characteristic) {
+  activityStats.hostWrites++;
   if (!characteristic) {
     return;
   }
@@ -556,6 +723,7 @@ void CompanionBleService::onHostTeamsStateWritten(NimBLECharacteristic* characte
   hostStatus.teamsDetected = next;
   hostStateReceived = true;
   if (changed || firstStateWrite) {
+    activityStats.hostStateChanges++;
     statusChanged = true;
     LOG_INF("COMP", "Host teams state=%d", hostStatus.teamsDetected);
     logStateSnapshot("teams_state");
@@ -565,6 +733,7 @@ void CompanionBleService::onHostTeamsStateWritten(NimBLECharacteristic* characte
 }
 
 void CompanionBleService::onHostMicrophoneStateWritten(NimBLECharacteristic* characteristic) {
+  activityStats.hostWrites++;
   if (!characteristic) {
     return;
   }
@@ -581,6 +750,7 @@ void CompanionBleService::onHostMicrophoneStateWritten(NimBLECharacteristic* cha
   hostStatus.microphone = next;
   hostStateReceived = true;
   if (changed || firstStateWrite) {
+    activityStats.hostStateChanges++;
     statusChanged = true;
     LOG_INF("COMP", "Host microphone state=%u", static_cast<unsigned>(hostStatus.microphone));
     logStateSnapshot("microphone_state");
@@ -590,6 +760,7 @@ void CompanionBleService::onHostMicrophoneStateWritten(NimBLECharacteristic* cha
 }
 
 void CompanionBleService::onHostCameraStateWritten(NimBLECharacteristic* characteristic) {
+  activityStats.hostWrites++;
   if (!characteristic) {
     return;
   }
@@ -606,6 +777,7 @@ void CompanionBleService::onHostCameraStateWritten(NimBLECharacteristic* charact
   hostStatus.camera = next;
   hostStateReceived = true;
   if (changed || firstStateWrite) {
+    activityStats.hostStateChanges++;
     statusChanged = true;
     LOG_INF("COMP", "Host camera state=%u", static_cast<unsigned>(hostStatus.camera));
     logStateSnapshot("camera_state");
@@ -615,6 +787,7 @@ void CompanionBleService::onHostCameraStateWritten(NimBLECharacteristic* charact
 }
 
 void CompanionBleService::onHostStatusMessageWritten(NimBLECharacteristic* characteristic) {
+  activityStats.hostWrites++;
   if (!characteristic) {
     return;
   }
@@ -629,6 +802,7 @@ void CompanionBleService::onHostStatusMessageWritten(NimBLECharacteristic* chara
   hostStatus.message = next;
   hostStateReceived = true;
   if (changed || firstStateWrite) {
+    activityStats.hostStateChanges++;
     statusChanged = true;
     LOG_INF("COMP", "Host message=%s", hostStatus.message.c_str());
     logStateSnapshot("message_state");
@@ -640,6 +814,7 @@ void CompanionBleService::onHostStatusMessageWritten(NimBLECharacteristic* chara
 void CompanionBleService::onButtonEventSubscribed(bool subscribed) {
   buttonEventSubscribed = subscribed;
   statusChanged = true;
+  activityStats.buttonSubscribes++;
   LOG_INF("COMP", "Companion host button notifications subscribed=%d", subscribed);
   requestIdleConnectionParamsIfReady("subscribe");
   logStateSnapshot("button_subscribe");
@@ -648,15 +823,22 @@ void CompanionBleService::onButtonEventSubscribed(bool subscribed) {
 
 void CompanionBleService::requestConnectionParams(ConnectionPowerProfile profile, const char* reason) {
   if (!server || !hostConnected || hostConnHandle == 0xFFFF) {
+    LOG_DBG("COMP", "Conn param request skipped reason=%s server=%p connected=%d handle=%u", reason ? reason : "",
+            server, hostConnected, static_cast<unsigned>(hostConnHandle));
     return;
   }
 
   const unsigned long now = millis();
   if (connectionProfile == profile) {
+    LOG_DBG("COMP", "Conn param request skipped reason=%s already profile=%s", reason ? reason : "",
+            profileName(profile));
     return;
   }
   if (lastConnParamRequestAtMs != 0 &&
       now - lastConnParamRequestAtMs < COMPANION_CONN_PARAM_REQUEST_MIN_INTERVAL_MS) {
+    LOG_INF("COMP", "Conn param request throttled reason=%s profile=%s ageMs=%lu minAgeMs=%lu", reason ? reason : "",
+            profileName(profile), static_cast<unsigned long>(now - lastConnParamRequestAtMs),
+            static_cast<unsigned long>(COMPANION_CONN_PARAM_REQUEST_MIN_INTERVAL_MS));
     return;
   }
 
@@ -673,6 +855,12 @@ void CompanionBleService::requestConnectionParams(ConnectionPowerProfile profile
 
   lastConnParamRequestAtMs = now;
   connectionProfile = profile;
+  requestedConnectionProfile = profile;
+  requestedConnIntervalMin = minInterval;
+  requestedConnIntervalMax = maxInterval;
+  requestedConnLatency = latency;
+  requestedConnTimeout = timeout;
+  activityStats.connParamRequests++;
   server->updateConnParams(hostConnHandle, minInterval, maxInterval, latency, timeout);
   LOG_INF("COMP", "Requested %s connection params reason=%s min=%u max=%u latency=%u timeout=%u", profileName(profile),
           reason ? reason : "", static_cast<unsigned>(minInterval), static_cast<unsigned>(maxInterval),
@@ -683,9 +871,13 @@ void CompanionBleService::requestConnectionParams(ConnectionPowerProfile profile
 
 void CompanionBleService::requestIdleConnectionParamsIfReady(const char* reason) {
   if (!hostConnected || !hostStateReceived || !buttonEventSubscribed) {
+    LOG_DBG("COMP", "Idle conn params not ready reason=%s connected=%d stateRx=%d buttonSub=%d", reason ? reason : "",
+            hostConnected, hostStateReceived, buttonEventSubscribed);
     return;
   }
   if (responsiveUntilMs != 0) {
+    LOG_DBG("COMP", "Idle conn params deferred reason=%s responsiveUntilMs=%lu nowMs=%lu", reason ? reason : "",
+            static_cast<unsigned long>(responsiveUntilMs), static_cast<unsigned long>(millis()));
     return;
   }
   requestConnectionParams(ConnectionPowerProfile::Idle, reason);
@@ -708,16 +900,21 @@ bool CompanionBleService::restartAdvertising(const char* reason) {
   const unsigned long now = millis();
   auto* advertising = NimBLEDevice::getAdvertising();
   if (advertising && advertising->isAdvertising()) {
+    LOG_DBG("COMP", "Advertising restart skipped; already advertising reason=%s", reason ? reason : "");
     return true;
   }
 
   if (lastAdvertisingRestartAtMs != 0 &&
       now - lastAdvertisingRestartAtMs < COMPANION_ADVERTISING_RESTART_INTERVAL_MS) {
+    LOG_INF("COMP", "Advertising restart throttled reason=%s ageMs=%lu minAgeMs=%lu", reason ? reason : "",
+            static_cast<unsigned long>(now - lastAdvertisingRestartAtMs),
+            static_cast<unsigned long>(COMPANION_ADVERTISING_RESTART_INTERVAL_MS));
     return false;
   }
 
   lastAdvertisingRestartAtMs = now;
   const bool ok = NimBLEDevice::startAdvertising();
+  activityStats.advertisingRestarts++;
   LOG_INF("COMP", "Advertising restart reason=%s ok=%d", reason ? reason : "", ok);
   BluetoothDiagnostics::recordf("companion_advertising_restart", "reason=%s ok=%d", reason ? reason : "", ok);
   return ok;
@@ -740,6 +937,7 @@ void CompanionBleService::publishHostStateValues() {
 }
 
 void CompanionBleService::notifyStatusChanged() {
+  activityStats.statusNotifications++;
   if (statusChangedCallback) {
     statusChangedCallback();
   }
@@ -780,6 +978,7 @@ void CompanionBleService::publishButtonEvent(uint8_t buttonId, uint8_t action) {
   };
   buttonEventCharacteristic->setValue(payload, sizeof(payload));
   buttonEventCharacteristic->notify();
+  activityStats.buttonNotifications++;
   LOG_INF("COMP", "Button event notified seq=%u button=%u action=%u uptimeMs=%lu",
           static_cast<unsigned>(buttonEventSequence), static_cast<unsigned>(buttonId), static_cast<unsigned>(action),
           static_cast<unsigned long>(uptimeMs));
@@ -790,6 +989,7 @@ void CompanionBleService::publishButtonEvent(uint8_t buttonId, uint8_t action) {
 
 void CompanionBleService::logStateSnapshot(const char* reason) {
   lastStateLogAtMs = millis();
+  activityStats.stateLogs++;
   LOG_INF("COMP", "State reason=%s running=%d connected=%d buttonSub=%d stateRx=%d profile=%s teams=%d mic=%u cam=%u heap=%u",
           reason ? reason : "", running, hostConnected, buttonEventSubscribed, hostStateReceived,
           profileName(connectionProfile), hostStatus.teamsDetected, static_cast<unsigned>(hostStatus.microphone),

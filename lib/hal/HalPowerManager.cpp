@@ -25,6 +25,7 @@ namespace {
 constexpr int AUTO_LIGHT_SLEEP_MIN_FREQ = 40;  // ESP32-C3 XTAL floor; valid for IDF DFS on this target.
 constexpr gpio_num_t X3_BATTERY_LATCH_PIN = GPIO_NUM_13;
 portMUX_TYPE lightSleepStatsMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE pmLockTimingMux = portMUX_INITIALIZER_UNLOCKED;
 uint32_t lightSleepEnterCount = 0;
 uint64_t lightSleepTotalUs = 0;
 uint64_t lightSleepRequestedTotalUs = 0;
@@ -33,6 +34,10 @@ int64_t lightSleepEnteredAtUs = 0;
 uint64_t lightSleepRequestedUs = 0;
 uint64_t lightSleepWakeCauseCounts[HalPowerManager::LIGHT_SLEEP_WAKE_CAUSE_COUNT] = {};
 uint64_t lightSleepRequestBucketCounts[HalPowerManager::LIGHT_SLEEP_REQUEST_BUCKET_COUNT] = {};
+uint64_t fullPmLockCount = 0;
+uint64_t fullPmLockHeldUs = 0;
+uint64_t peripheralPmLockCount = 0;
+uint64_t peripheralPmLockHeldUs = 0;
 bool lightSleepCallbacksRegistered = false;
 bool x3BatteryLatchHeldForLightSleep = false;
 
@@ -41,6 +46,8 @@ constexpr uint8_t TASK_RUNTIME_TOP_COUNT = 8;
 constexpr uint8_t TIMER_ACTIVITY_MAX_TIMERS = 48;
 constexpr uint8_t TIMER_ACTIVITY_TOP_COUNT = 5;
 constexpr size_t TIMER_ACTIVITY_NAME_LEN = 21;
+constexpr uint8_t PM_LOCK_ACTIVITY_TOP_COUNT = 5;
+constexpr uint8_t PM_LOCK_ACTIVITY_MAX_ROWS = 24;
 
 struct TaskRuntimeSnapshot {
   TaskHandle_t handle = nullptr;
@@ -49,12 +56,14 @@ struct TaskRuntimeSnapshot {
 };
 
 struct TaskRuntimeDelta {
-  const char* name = "";
+  char name[configMAX_TASK_NAME_LEN] = {};
   configRUN_TIME_COUNTER_TYPE delta = 0;
   eTaskState state = eInvalid;
   UBaseType_t priority = 0;
   configSTACK_DEPTH_TYPE stackHighWaterMark = 0;
 };
+
+enum class TaskRuntimeCaptureStatus { Unavailable, Baseline, Delta };
 
 TaskRuntimeSnapshot previousTaskRuntime[TASK_RUNTIME_MAX_TASKS];
 UBaseType_t previousTaskRuntimeCount = 0;
@@ -75,9 +84,32 @@ struct TimerActivityDelta {
   uint64_t callbackTimeUs = 0;
 };
 
+struct PmLockActivityRow {
+  char name[16] = {};
+  char type[15] = {};
+  int active = 0;
+  unsigned long long totalCount = 0;
+  unsigned long long timeUs = 0;
+  unsigned long long timePercent = 0;
+  bool valid = false;
+};
+
+struct PmLockActivityDelta {
+  char name[16] = {};
+  char type[15] = {};
+  int active = 0;
+  unsigned long long countDelta = 0;
+  unsigned long long timeDeltaUs = 0;
+  bool valid = false;
+};
+
 TimerActivitySnapshot previousTimerActivity[TIMER_ACTIVITY_MAX_TIMERS];
 uint8_t previousTimerActivityCount = 0;
 bool hasPreviousTimerActivity = false;
+PmLockActivityRow previousPmLockActivity[PM_LOCK_ACTIVITY_MAX_ROWS];
+uint8_t previousPmLockActivityCount = 0;
+uint64_t previousPmLockActivityTimeUs = 0;
+bool hasPreviousPmLockActivity = false;
 
 uint8_t lightSleepWakeCauseIndex(esp_sleep_wakeup_cause_t cause) {
   const auto index = static_cast<uint32_t>(cause);
@@ -114,6 +146,24 @@ bool isEarlyLightSleepWake(uint64_t requestedUs, uint64_t sleptUs) {
   const uint64_t measurementSlackUs = 500ULL;
   const uint64_t expectedUs = requestedUs > pmEarlyWakeMarginUs ? requestedUs - pmEarlyWakeMarginUs : requestedUs;
   return sleptUs + measurementSlackUs < expectedUs;
+}
+
+void recordPmLockHold(bool peripheral, int64_t acquiredAtUs) {
+  const int64_t nowUs = esp_timer_get_time();
+  if (acquiredAtUs <= 0 || nowUs < acquiredAtUs) {
+    return;
+  }
+
+  const uint64_t heldUs = static_cast<uint64_t>(nowUs - acquiredAtUs);
+  portENTER_CRITICAL(&pmLockTimingMux);
+  if (peripheral) {
+    peripheralPmLockCount++;
+    peripheralPmLockHeldUs += heldUs;
+  } else {
+    fullPmLockCount++;
+    fullPmLockHeldUs += heldUs;
+  }
+  portEXIT_CRITICAL(&pmLockTimingMux);
 }
 
 void holdX3BatteryLatchForLightSleep() {
@@ -286,20 +336,129 @@ void storeTimerActivitySnapshot(const TimerActivitySnapshot* timers, uint8_t cou
   hasPreviousTimerActivity = true;
 }
 
-void logPmLockDiagnostics() {
-  char* dump = nullptr;
-  size_t dumpSize = 0;
-  FILE* stream = open_memstream(&dump, &dumpSize);
+bool capturePmLockDump(char** dump, size_t* dumpSize) {
+  *dump = nullptr;
+  *dumpSize = 0;
+  FILE* stream = open_memstream(dump, dumpSize);
   if (!stream) {
-    LOG_INF("PWR", "PM lock dump unavailable: stream allocation failed");
-    return;
+    return false;
   }
 
   const esp_err_t err = esp_pm_dump_locks(stream);
   fclose(stream);
-  if (err != ESP_OK || !dump) {
-    free(dump);
-    LOG_INF("PWR", "PM lock dump unavailable err=%d", err);
+  if (err != ESP_OK || !*dump) {
+    free(*dump);
+    *dump = nullptr;
+    *dumpSize = 0;
+    return false;
+  }
+  return true;
+}
+
+const char* shortPmLockType(const char* type) {
+  if (strcmp(type, "NO_LIGHT_SLEEP") == 0) {
+    return "noLS";
+  }
+  if (strcmp(type, "APB_FREQ_MAX") == 0) {
+    return "apb";
+  }
+  if (strcmp(type, "CPU_FREQ_MAX") == 0) {
+    return "cpu";
+  }
+  return type;
+}
+
+bool parsePmLockDumpLine(const char* line, PmLockActivityRow& row) {
+  char name[16] = {};
+  char type[15] = {};
+  int arg = 0;
+  int active = 0;
+  unsigned long long totalCount = 0;
+  unsigned long long timeUs = 0;
+  unsigned long long timePercent = 0;
+  if (sscanf(line, "%15s %14s %d %d %llu %llu %llu%%", name, type, &arg, &active, &totalCount, &timeUs,
+             &timePercent) != 7) {
+    return false;
+  }
+
+  snprintf(row.name, sizeof(row.name), "%s", name);
+  snprintf(row.type, sizeof(row.type), "%s", shortPmLockType(type));
+  row.active = active;
+  row.totalCount = totalCount;
+  row.timeUs = timeUs;
+  row.timePercent = timePercent;
+  row.valid = true;
+  return true;
+}
+
+bool parsePmLockDumpTimeLine(const char* line, uint64_t& bootTimeUs) {
+  unsigned long long parsed = 0;
+  if (sscanf(line, "Time since bootup: %llu us", &parsed) != 1) {
+    return false;
+  }
+  bootTimeUs = parsed;
+  return true;
+}
+
+const PmLockActivityRow* findPreviousPmLockActivity(const char* name, const char* type) {
+  for (uint8_t i = 0; i < previousPmLockActivityCount; i++) {
+    if (strncmp(previousPmLockActivity[i].name, name, sizeof(previousPmLockActivity[i].name)) == 0 &&
+        strncmp(previousPmLockActivity[i].type, type, sizeof(previousPmLockActivity[i].type)) == 0) {
+      return &previousPmLockActivity[i];
+    }
+  }
+  return nullptr;
+}
+
+void storePmLockActivitySnapshot(const PmLockActivityRow rows[PM_LOCK_ACTIVITY_MAX_ROWS], uint8_t rowCount,
+                                 uint64_t bootTimeUs) {
+  previousPmLockActivityCount = rowCount;
+  for (uint8_t i = 0; i < rowCount; i++) {
+    previousPmLockActivity[i] = rows[i];
+  }
+  previousPmLockActivityTimeUs = bootTimeUs;
+  hasPreviousPmLockActivity = true;
+}
+
+bool pmLockDeltaRanksAbove(const PmLockActivityDelta& candidate, const PmLockActivityDelta& existing) {
+  if (!existing.valid) {
+    return true;
+  }
+  if (candidate.timeDeltaUs != existing.timeDeltaUs) {
+    return candidate.timeDeltaUs > existing.timeDeltaUs;
+  }
+  if (candidate.countDelta != existing.countDelta) {
+    return candidate.countDelta > existing.countDelta;
+  }
+  if (candidate.active != existing.active) {
+    return candidate.active > existing.active;
+  }
+  return strcmp(candidate.name, existing.name) < 0;
+}
+
+void insertPmLockActivityDelta(PmLockActivityDelta topRows[PM_LOCK_ACTIVITY_TOP_COUNT],
+                               const PmLockActivityDelta& row) {
+  if (row.timeDeltaUs == 0 && row.countDelta == 0 && row.active == 0) {
+    return;
+  }
+
+  for (uint8_t i = 0; i < PM_LOCK_ACTIVITY_TOP_COUNT; i++) {
+    if (!pmLockDeltaRanksAbove(row, topRows[i])) {
+      continue;
+    }
+    for (uint8_t j = PM_LOCK_ACTIVITY_TOP_COUNT - 1; j > i; j--) {
+      topRows[j] = topRows[j - 1];
+    }
+    topRows[i] = row;
+    return;
+  }
+}
+
+void logPmLockDiagnostics() {
+  char* dump = nullptr;
+  size_t dumpSize = 0;
+  if (!capturePmLockDump(&dump, &dumpSize)) {
+    LOG_INF("PWR", "PM lock dump unavailable");
     return;
   }
 
@@ -368,13 +527,11 @@ void insertTaskRuntimeDelta(TaskRuntimeDelta topDeltas[TASK_RUNTIME_TOP_COUNT], 
       topDeltas[j] = topDeltas[j - 1];
     }
 
-    topDeltas[i] = TaskRuntimeDelta{
-        .name = task.pcTaskName ? task.pcTaskName : "",
-        .delta = delta,
-        .state = task.eCurrentState,
-        .priority = task.uxCurrentPriority,
-        .stackHighWaterMark = task.usStackHighWaterMark,
-    };
+    topDeltas[i].delta = delta;
+    topDeltas[i].state = task.eCurrentState;
+    topDeltas[i].priority = task.uxCurrentPriority;
+    topDeltas[i].stackHighWaterMark = task.usStackHighWaterMark;
+    snprintf(topDeltas[i].name, sizeof(topDeltas[i].name), "%s", task.pcTaskName ? task.pcTaskName : "");
     return;
   }
 }
@@ -392,26 +549,24 @@ void storeTaskRuntimeSnapshot(const TaskStatus_t* tasks, UBaseType_t taskCount,
   hasPreviousTaskRuntime = true;
 }
 
-void logTaskRuntimeDiagnostics() {
+TaskRuntimeCaptureStatus captureTaskRuntimeDeltas(TaskRuntimeDelta topDeltas[TASK_RUNTIME_TOP_COUNT],
+                                                  configRUN_TIME_COUNTER_TYPE& totalDelta, UBaseType_t& taskCount,
+                                                  UBaseType_t& knownTaskCount) {
   TaskStatus_t tasks[TASK_RUNTIME_MAX_TASKS] = {};
   configRUN_TIME_COUNTER_TYPE totalRuntime = 0;
-  const UBaseType_t knownTaskCount = uxTaskGetNumberOfTasks();
-  const UBaseType_t taskCount = uxTaskGetSystemState(tasks, TASK_RUNTIME_MAX_TASKS, &totalRuntime);
+  totalDelta = 0;
+  knownTaskCount = uxTaskGetNumberOfTasks();
+  taskCount = uxTaskGetSystemState(tasks, TASK_RUNTIME_MAX_TASKS, &totalRuntime);
   if (taskCount == 0) {
-    LOG_INF("PWR", "Task runtime unavailable tasks=%u cap=%u", static_cast<unsigned>(knownTaskCount),
-            static_cast<unsigned>(TASK_RUNTIME_MAX_TASKS));
-    return;
+    return TaskRuntimeCaptureStatus::Unavailable;
   }
 
   if (!hasPreviousTaskRuntime) {
     storeTaskRuntimeSnapshot(tasks, taskCount, totalRuntime);
-    LOG_INF("PWR", "Task runtime baseline captured tasks=%u total=%llu", static_cast<unsigned>(taskCount),
-            static_cast<unsigned long long>(totalRuntime));
-    return;
+    return TaskRuntimeCaptureStatus::Baseline;
   }
 
-  TaskRuntimeDelta topDeltas[TASK_RUNTIME_TOP_COUNT] = {};
-  const configRUN_TIME_COUNTER_TYPE totalDelta = runtimeDelta(totalRuntime, previousTaskRuntimeTotal);
+  totalDelta = runtimeDelta(totalRuntime, previousTaskRuntimeTotal);
   for (UBaseType_t i = 0; i < taskCount; i++) {
     const TaskRuntimeSnapshot* previous = findPreviousTaskRuntime(tasks[i].xHandle);
     if (!previous) {
@@ -419,6 +574,27 @@ void logTaskRuntimeDiagnostics() {
       continue;
     }
     insertTaskRuntimeDelta(topDeltas, tasks[i], runtimeDelta(tasks[i].ulRunTimeCounter, previous->runtime));
+  }
+
+  storeTaskRuntimeSnapshot(tasks, taskCount, totalRuntime);
+  return TaskRuntimeCaptureStatus::Delta;
+}
+
+void logTaskRuntimeDiagnostics() {
+  TaskRuntimeDelta topDeltas[TASK_RUNTIME_TOP_COUNT] = {};
+  configRUN_TIME_COUNTER_TYPE totalDelta = 0;
+  UBaseType_t taskCount = 0;
+  UBaseType_t knownTaskCount = 0;
+  const TaskRuntimeCaptureStatus status =
+      captureTaskRuntimeDeltas(topDeltas, totalDelta, taskCount, knownTaskCount);
+  if (status == TaskRuntimeCaptureStatus::Unavailable) {
+    LOG_INF("PWR", "Task runtime unavailable tasks=%u cap=%u", static_cast<unsigned>(knownTaskCount),
+            static_cast<unsigned>(TASK_RUNTIME_MAX_TASKS));
+    return;
+  }
+  if (status == TaskRuntimeCaptureStatus::Baseline) {
+    LOG_INF("PWR", "Task runtime baseline captured tasks=%u", static_cast<unsigned>(taskCount));
+    return;
   }
 
   LOG_INF("PWR", "Task runtime delta tasks=%u known=%u total=%llu", static_cast<unsigned>(taskCount),
@@ -436,8 +612,6 @@ void logTaskRuntimeDiagnostics() {
             taskStateName(topDeltas[i].state), static_cast<unsigned>(topDeltas[i].priority),
             static_cast<unsigned>(topDeltas[i].stackHighWaterMark));
   }
-
-  storeTaskRuntimeSnapshot(tasks, taskCount, totalRuntime);
 }
 
 #if CONFIG_PM_LIGHT_SLEEP_CALLBACKS
@@ -527,6 +701,23 @@ void formatDurationUs(uint64_t durationUs, char* buffer, size_t bufferSize) {
   const uint64_t remainingMinutes = minutes % 60ULL;
   snprintf(buffer, bufferSize, "%lluh%02llum", static_cast<unsigned long long>(hours),
            static_cast<unsigned long long>(remainingMinutes));
+}
+
+void formatPmLockDurationUs(uint64_t durationUs, char* buffer, size_t bufferSize) {
+  const uint64_t totalMs = durationUs / 1000ULL;
+  if (totalMs < 10000ULL) {
+    snprintf(buffer, bufferSize, "%llums", static_cast<unsigned long long>(totalMs));
+    return;
+  }
+
+  const uint64_t tenths = (durationUs + 50000ULL) / 100000ULL;
+  if (tenths < 600ULL) {
+    snprintf(buffer, bufferSize, "%llu.%llus", static_cast<unsigned long long>(tenths / 10ULL),
+             static_cast<unsigned long long>(tenths % 10ULL));
+    return;
+  }
+
+  formatDurationUs(durationUs, buffer, bufferSize);
 }
 }  // namespace
 
@@ -737,6 +928,17 @@ HalPowerManager::LightSleepStats HalPowerManager::getLightSleepStats() const {
   return stats;
 }
 
+HalPowerManager::PmLockTimingStats HalPowerManager::getPmLockTimingStats() const {
+  PmLockTimingStats stats;
+  portENTER_CRITICAL(&pmLockTimingMux);
+  stats.fullLockCount = fullPmLockCount;
+  stats.fullLockHeldUs = fullPmLockHeldUs;
+  stats.peripheralLockCount = peripheralPmLockCount;
+  stats.peripheralLockHeldUs = peripheralPmLockHeldUs;
+  portEXIT_CRITICAL(&pmLockTimingMux);
+  return stats;
+}
+
 std::string HalPowerManager::formatLightSleepStats() const {
   const auto stats = getLightSleepStats();
   char slept[16];
@@ -800,6 +1002,151 @@ std::string HalPowerManager::formatEspTimerActivity() const {
   return line;
 #else
   return "Timers: profiling off";
+#endif
+}
+
+std::string HalPowerManager::formatTaskRuntimeActivity() const {
+#if configGENERATE_RUN_TIME_STATS
+  TaskRuntimeDelta topDeltas[TASK_RUNTIME_TOP_COUNT] = {};
+  configRUN_TIME_COUNTER_TYPE totalDelta = 0;
+  UBaseType_t taskCount = 0;
+  UBaseType_t knownTaskCount = 0;
+  const TaskRuntimeCaptureStatus status =
+      captureTaskRuntimeDeltas(topDeltas, totalDelta, taskCount, knownTaskCount);
+  if (status == TaskRuntimeCaptureStatus::Unavailable) {
+    char line[48];
+    snprintf(line, sizeof(line), "Tasks: unavailable %u/%u", static_cast<unsigned>(taskCount),
+             static_cast<unsigned>(knownTaskCount));
+    return line;
+  }
+  if (status == TaskRuntimeCaptureStatus::Baseline) {
+    return "Tasks: baseline";
+  }
+
+  std::string line = "Tasks:";
+  if (totalDelta == 0 || topDeltas[0].delta == 0) {
+    line += " none";
+    return line;
+  }
+
+  for (uint8_t i = 0; i < 5 && i < TASK_RUNTIME_TOP_COUNT; i++) {
+    if (topDeltas[i].delta == 0) {
+      break;
+    }
+
+    char shortName[12];
+    shortenTimerName(topDeltas[i].name, shortName, sizeof(shortName));
+    const unsigned long long pctX10 =
+        totalDelta > 0 ? (static_cast<unsigned long long>(topDeltas[i].delta) * 1000ULL) / totalDelta : 0ULL;
+    char part[32];
+    snprintf(part, sizeof(part), " %s %llu.%llu%%", shortName, pctX10 / 10ULL, pctX10 % 10ULL);
+    line += part;
+  }
+  return line;
+#else
+  return "Tasks: runtime stats off";
+#endif
+}
+
+void HalPowerManager::formatPmLockActivity(std::string& line1, std::string& line2, std::string& line3,
+                                           std::string& line4, std::string& line5) const {
+#if CONFIG_PM_PROFILING
+  char* dump = nullptr;
+  size_t dumpSize = 0;
+  if (!capturePmLockDump(&dump, &dumpSize)) {
+    line1 = "PM1: unavailable";
+    line2 = "PM2: unavailable";
+    line3 = "PM3: unavailable";
+    line4 = "PM4: unavailable";
+    line5 = "PM5: unavailable";
+    return;
+  }
+
+  PmLockActivityRow currentRows[PM_LOCK_ACTIVITY_MAX_ROWS] = {};
+  uint8_t currentRowCount = 0;
+  uint64_t bootTimeUs = 0;
+  char* cursor = dump;
+  while (cursor && *cursor) {
+    char* next = strchr(cursor, '\n');
+    if (next) {
+      *next = '\0';
+    }
+
+    parsePmLockDumpTimeLine(cursor, bootTimeUs);
+    PmLockActivityRow row;
+    if (currentRowCount < PM_LOCK_ACTIVITY_MAX_ROWS && parsePmLockDumpLine(cursor, row)) {
+      currentRows[currentRowCount++] = row;
+    }
+
+    cursor = next ? next + 1 : nullptr;
+  }
+  free(dump);
+
+  if (bootTimeUs == 0) {
+    bootTimeUs = static_cast<uint64_t>(esp_timer_get_time());
+  }
+
+  if (!hasPreviousPmLockActivity || bootTimeUs <= previousPmLockActivityTimeUs) {
+    storePmLockActivitySnapshot(currentRows, currentRowCount, bootTimeUs);
+    line1 = "PM1: baseline";
+    line2 = "PM2: delta next sample";
+    line3 = "PM3: none";
+    line4 = "PM4: none";
+    line5 = "PM5: none";
+    return;
+  }
+
+  const uint64_t elapsedUs = bootTimeUs - previousPmLockActivityTimeUs;
+  PmLockActivityDelta topRows[PM_LOCK_ACTIVITY_TOP_COUNT] = {};
+  for (uint8_t i = 0; i < currentRowCount; i++) {
+    const PmLockActivityRow& current = currentRows[i];
+    const PmLockActivityRow* previous = findPreviousPmLockActivity(current.name, current.type);
+    if (!previous) {
+      continue;
+    }
+
+    PmLockActivityDelta delta;
+    snprintf(delta.name, sizeof(delta.name), "%s", current.name);
+    snprintf(delta.type, sizeof(delta.type), "%s", current.type);
+    delta.active = current.active;
+    delta.countDelta = current.totalCount >= previous->totalCount ? current.totalCount - previous->totalCount : 0;
+    delta.timeDeltaUs = current.timeUs >= previous->timeUs ? current.timeUs - previous->timeUs : 0;
+    delta.valid = true;
+    insertPmLockActivityDelta(topRows, delta);
+  }
+  storePmLockActivitySnapshot(currentRows, currentRowCount, bootTimeUs);
+
+  auto formatRow = [elapsedUs](const char* prefix, const PmLockActivityDelta& row) {
+    if (!row.valid) {
+      std::string line(prefix);
+      line += " none";
+      return line;
+    }
+
+    char held[16];
+    char average[16];
+    formatPmLockDurationUs(row.timeDeltaUs, held, sizeof(held));
+    formatPmLockDurationUs(row.countDelta > 0 ? row.timeDeltaUs / row.countDelta : 0, average, sizeof(average));
+    const unsigned long long pctX10 =
+        elapsedUs > 0 ? (static_cast<unsigned long long>(row.timeDeltaUs) * 1000ULL) / elapsedUs : 0ULL;
+
+    char line[112];
+    snprintf(line, sizeof(line), "%s %s %s +%llu %s avg%s %llu.%llu%% act=%d", prefix, row.name, row.type,
+             row.countDelta, held, average, pctX10 / 10ULL, pctX10 % 10ULL, row.active);
+    return std::string(line);
+  };
+
+  line1 = formatRow("PM1:", topRows[0]);
+  line2 = formatRow("PM2:", topRows[1]);
+  line3 = formatRow("PM3:", topRows[2]);
+  line4 = formatRow("PM4:", topRows[3]);
+  line5 = formatRow("PM5:", topRows[4]);
+#else
+  line1 = "PM1: profiling off";
+  line2 = "PM2: profiling off";
+  line3 = "PM3: profiling off";
+  line4 = "PM4: profiling off";
+  line5 = "PM5: profiling off";
 #endif
 }
 
@@ -889,7 +1236,6 @@ void HalPowerManager::logLightSleepDiagnostics(const char* reason) const {
             static_cast<unsigned long long>(stats.requestBucketCounts[i]));
   }
   LOG_INF("PWR", "%s", btPower.c_str());
-  logTaskRuntimeDiagnostics();
   logPmLockDiagnostics();
 }
 
@@ -986,6 +1332,9 @@ HalPowerManager::Lock::Lock() {
         valid = false;
       }
     }
+    if (noLightSleepLockAcquired) {
+      noLightSleepLockAcquiredAtUs = esp_timer_get_time();
+    }
   }
   xSemaphoreGive(powerManager.modeMutex);
   if (valid) {
@@ -997,6 +1346,10 @@ HalPowerManager::Lock::Lock() {
 HalPowerManager::Lock::~Lock() {
   xSemaphoreTake(powerManager.modeMutex, portMAX_DELAY);
   if (valid) {
+    if (noLightSleepLockAcquired) {
+      recordPmLockHold(false, noLightSleepLockAcquiredAtUs);
+      noLightSleepLockAcquiredAtUs = 0;
+    }
     releasePmLock(powerManager.noLightSleepLock, noLightSleepLockAcquired, "no-light-sleep");
     releasePmLock(powerManager.apbMaxLock, apbLockAcquired, "APB max");
     releasePmLock(powerManager.cpuMaxLock, cpuLockAcquired, "CPU max");
@@ -1017,6 +1370,9 @@ HalPowerManager::PeripheralLock::PeripheralLock() {
       releasePmLock(powerManager.noLightSleepLock, noLightSleepLockAcquired, "no-light-sleep");
       releasePmLock(powerManager.apbMaxLock, apbLockAcquired, "APB max");
     }
+    if (noLightSleepLockAcquired) {
+      noLightSleepLockAcquiredAtUs = esp_timer_get_time();
+    }
   }
   xSemaphoreGive(powerManager.modeMutex);
 }
@@ -1027,6 +1383,10 @@ HalPowerManager::PeripheralLock::~PeripheralLock() {
   }
 
   xSemaphoreTake(powerManager.modeMutex, portMAX_DELAY);
+  if (noLightSleepLockAcquired) {
+    recordPmLockHold(true, noLightSleepLockAcquiredAtUs);
+    noLightSleepLockAcquiredAtUs = 0;
+  }
   releasePmLock(powerManager.noLightSleepLock, noLightSleepLockAcquired, "no-light-sleep");
   releasePmLock(powerManager.apbMaxLock, apbLockAcquired, "APB max");
   xSemaphoreGive(powerManager.modeMutex);

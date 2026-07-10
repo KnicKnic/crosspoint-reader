@@ -22,6 +22,22 @@ class CompanionBleService {
     std::string message;
   };
 
+  struct ActivityStats {
+    uint32_t updateCalls = 0;
+    uint32_t maintenanceRuns = 0;
+    uint32_t gapConnects = 0;
+    uint32_t gapDisconnects = 0;
+    uint32_t connParamRequests = 0;
+    uint32_t connParamUpdates = 0;
+    uint32_t hostWrites = 0;
+    uint32_t hostStateChanges = 0;
+    uint32_t buttonSubscribes = 0;
+    uint32_t buttonNotifications = 0;
+    uint32_t advertisingRestarts = 0;
+    uint32_t stateLogs = 0;
+    uint32_t statusNotifications = 0;
+  };
+
   static CompanionBleService& getInstance();
 
   bool begin();
@@ -35,6 +51,8 @@ class CompanionBleService {
   HostStatus getHostStatus() const;
   bool consumeStatusChanged();
   bool notifyToggleMuteReleased();
+  std::string formatTimingDiagnostics() const;
+  std::string formatActivityDeltaDiagnostics();
   void setStatusChangedCallback(std::function<void()> callback);
 
   void onHostConnected();
@@ -76,7 +94,15 @@ class CompanionBleService {
   bool ownsBluetoothStack = false;
   bool statusChanged = false;
   ConnectionPowerProfile connectionProfile = ConnectionPowerProfile::Unknown;
+  ConnectionPowerProfile requestedConnectionProfile = ConnectionPowerProfile::Unknown;
   uint16_t hostConnHandle = 0xFFFF;
+  uint16_t requestedConnIntervalMin = 0;
+  uint16_t requestedConnIntervalMax = 0;
+  uint16_t requestedConnLatency = 0;
+  uint16_t requestedConnTimeout = 0;
+  uint16_t negotiatedConnInterval = 0;
+  uint16_t negotiatedConnLatency = 0;
+  uint16_t negotiatedConnTimeout = 0;
   unsigned long hostConnectedAtMs = 0;
   unsigned long lastMaintenanceAtMs = 0;
   unsigned long lastStateLogAtMs = 0;
@@ -85,8 +111,12 @@ class CompanionBleService {
   unsigned long lastConnParamRequestAtMs = 0;
   unsigned long responsiveUntilMs = 0;
   bool advertisingRestartPending = false;
+  bool hasNegotiatedConnParams = false;
   const char* pendingAdvertisingRestartReason = nullptr;
   uint16_t buttonEventSequence = 0;
   HostStatus hostStatus;
+  ActivityStats activityStats;
+  ActivityStats previousActivityStats;
+  bool hasPreviousActivityStats = false;
   std::function<void()> statusChangedCallback;
 };

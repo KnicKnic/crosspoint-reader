@@ -53,6 +53,13 @@ class HalPowerManager {
     uint64_t requestBucketCounts[LIGHT_SLEEP_REQUEST_BUCKET_COUNT] = {};
   };
 
+  struct PmLockTimingStats {
+    uint64_t fullLockCount = 0;
+    uint64_t fullLockHeldUs = 0;
+    uint64_t peripheralLockCount = 0;
+    uint64_t peripheralLockHeldUs = 0;
+  };
+
   static constexpr int LOW_POWER_FREQ = 10;                    // MHz
   static constexpr unsigned long IDLE_POWER_SAVING_MS = 3000;  // ms
   static constexpr unsigned long BATTERY_POLL_MS = 1500;       // ms
@@ -67,8 +74,12 @@ class HalPowerManager {
   bool configureAutoLightSleep(bool enabled);
   bool isAutoLightSleepConfigured() const { return autoLightSleepConfigured; }
   LightSleepStats getLightSleepStats() const;
+  PmLockTimingStats getPmLockTimingStats() const;
   std::string formatLightSleepStats() const;
   std::string formatEspTimerActivity() const;
+  std::string formatTaskRuntimeActivity() const;
+  void formatPmLockActivity(std::string& line1, std::string& line2, std::string& line3, std::string& line4,
+                            std::string& line5) const;
   void logLightSleepDiagnostics(const char* reason) const;
   static const char* lightSleepWakeCauseName(uint8_t causeIndex);
   static const char* lightSleepRequestBucketName(uint8_t bucketIndex);
@@ -89,6 +100,7 @@ class HalPowerManager {
     bool cpuLockAcquired = false;
     bool apbLockAcquired = false;
     bool noLightSleepLockAcquired = false;
+    int64_t noLightSleepLockAcquiredAtUs = 0;
 
    public:
     explicit Lock();
@@ -107,6 +119,7 @@ class HalPowerManager {
     friend class HalPowerManager;
     bool apbLockAcquired = false;
     bool noLightSleepLockAcquired = false;
+    int64_t noLightSleepLockAcquiredAtUs = 0;
 
    public:
     explicit PeripheralLock();

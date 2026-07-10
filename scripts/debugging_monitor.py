@@ -305,8 +305,8 @@ def serial_worker(ser, kwargs: dict[str, str]) -> None:
                     elif clean_line == "SCREENSHOT_END":
                         continue  # ignore
 
-                    # Add PC timestamp
-                    pc_time = datetime.now().strftime("%H:%M:%S")
+                    # Add PC timestamp with millisecond precision.
+                    pc_time = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                     formatted_line = re.sub(r"^\[\d+\]", f"[{pc_time}]", clean_line)
 
                     # Check for Memory Line

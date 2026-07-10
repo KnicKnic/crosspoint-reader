@@ -1,10 +1,12 @@
 #include "LaptopCompanionActivity.h"
 
 #include <Arduino.h>
+#include <esp_log.h>
 
 #include <HalGPIO.h>
 #include <HalPowerManager.h>
 #include <Logging.h>
+#include <PmLockTrace.h>
 
 #include <cstdio>
 
@@ -15,8 +17,10 @@
 namespace {
 constexpr unsigned long NO_HOST_WAKE_GRACE_MS = 10UL * 60UL * 1000UL;
 constexpr unsigned long POWER_DIAGNOSTIC_INTERVAL_MS = 20UL * 1000UL;
-constexpr unsigned long LOOP_DELAY_MS = 1000UL;
+constexpr unsigned long LOOP_DELAY_MS = 100UL;
 constexpr bool COMPANION_POWER_BUTTON_LIGHT_SLEEP_WAKE_ENABLED = false;
+constexpr bool COMPANION_DISABLE_BLE_EXPERIMENT = false;
+constexpr bool COMPANION_SERIAL_DIAGNOSTICS_ENABLED = false;
 
 struct NamedDelta {
   const char* name = "";
@@ -56,9 +60,13 @@ std::string formatPowerStatsLine(const HalPowerManager::LightSleepStats& stats) 
   formatDurationUs(stats.sleptUs, slept, sizeof(slept));
   formatDurationUs(stats.uptimeUs, uptime, sizeof(uptime));
 
-  char line[80];
-  snprintf(line, sizeof(line), "Total: %lu x, sleep %s, boot %s", static_cast<unsigned long>(stats.enterCount), slept,
-           uptime);
+  const uint64_t percentTenths = stats.uptimeUs > 0 ? (stats.sleptUs * 1000ULL) / stats.uptimeUs : 0;
+
+  char line[96];
+  snprintf(line, sizeof(line), "Total: %lu x, sleep %s / %s (%llu.%01llu%%)",
+           static_cast<unsigned long>(stats.enterCount), slept, uptime,
+           static_cast<unsigned long long>(percentTenths / 10ULL),
+           static_cast<unsigned long long>(percentTenths % 10ULL));
   return line;
 }
 
@@ -172,6 +180,102 @@ std::string formatPowerDeltaLine(const HalPowerManager::LightSleepStats& current
            static_cast<unsigned long long>(percentTenths % 10ULL));
   return line;
 }
+
+std::string formatPowerAccountingLine(const HalPowerManager::LightSleepStats& current,
+                                      const HalPowerManager::LightSleepStats& previous, bool hasPrevious) {
+  const uint64_t sleptDelta =
+      hasPrevious && current.sleptUs >= previous.sleptUs ? current.sleptUs - previous.sleptUs : 0;
+  const uint64_t requestedDelta =
+      hasPrevious && current.requestedUs >= previous.requestedUs ? current.requestedUs - previous.requestedUs : 0;
+  const uint64_t elapsedDelta =
+      hasPrevious && current.uptimeUs >= previous.uptimeUs ? current.uptimeUs - previous.uptimeUs : 0;
+  const uint64_t awakeDelta = elapsedDelta > sleptDelta ? elapsedDelta - sleptDelta : 0;
+  const uint64_t requestedNotSleptDelta = requestedDelta > sleptDelta ? requestedDelta - sleptDelta : 0;
+  const uint64_t awakePercentTenths = elapsedDelta > 0 ? (awakeDelta * 1000ULL) / elapsedDelta : 0;
+  const uint64_t lostPercentTenths =
+      elapsedDelta > 0 ? (requestedNotSleptDelta * 1000ULL) / elapsedDelta : 0;
+
+  char awake[16];
+  char requested[16];
+  char lost[16];
+  formatDurationUs(awakeDelta, awake, sizeof(awake));
+  formatDurationUs(requestedDelta, requested, sizeof(requested));
+  formatDurationUs(requestedNotSleptDelta, lost, sizeof(lost));
+
+  char line[112];
+  snprintf(line, sizeof(line), "Acct: awake %s %llu.%llu%% req %s lost %s %llu.%llu%%", awake,
+           static_cast<unsigned long long>(awakePercentTenths / 10ULL),
+           static_cast<unsigned long long>(awakePercentTenths % 10ULL), requested, lost,
+           static_cast<unsigned long long>(lostPercentTenths / 10ULL),
+           static_cast<unsigned long long>(lostPercentTenths % 10ULL));
+  return line;
+}
+
+std::string formatBlockCostLine(unsigned long renderDurationMs,
+                                const HalPowerManager::PmLockTimingStats& currentLocks,
+                                const HalPowerManager::PmLockTimingStats& previousLocks, bool hasPreviousLocks) {
+  const uint64_t fullCountDelta =
+      hasPreviousLocks && currentLocks.fullLockCount >= previousLocks.fullLockCount
+          ? currentLocks.fullLockCount - previousLocks.fullLockCount
+          : 0;
+  const uint64_t fullHeldDelta =
+      hasPreviousLocks && currentLocks.fullLockHeldUs >= previousLocks.fullLockHeldUs
+          ? currentLocks.fullLockHeldUs - previousLocks.fullLockHeldUs
+          : 0;
+  const uint64_t peripheralCountDelta =
+      hasPreviousLocks && currentLocks.peripheralLockCount >= previousLocks.peripheralLockCount
+          ? currentLocks.peripheralLockCount - previousLocks.peripheralLockCount
+          : 0;
+  const uint64_t peripheralHeldDelta =
+      hasPreviousLocks && currentLocks.peripheralLockHeldUs >= previousLocks.peripheralLockHeldUs
+          ? currentLocks.peripheralLockHeldUs - previousLocks.peripheralLockHeldUs
+          : 0;
+
+  char render[16];
+  char full[16];
+  char peripheral[16];
+  formatDurationUs(static_cast<uint64_t>(renderDurationMs) * 1000ULL, render, sizeof(render));
+  formatDurationUs(fullHeldDelta, full, sizeof(full));
+  formatDurationUs(peripheralHeldDelta, peripheral, sizeof(peripheral));
+
+  char line[96];
+  snprintf(line, sizeof(line), "Block: render %s full %llu/%s per %llu/%s", render,
+           static_cast<unsigned long long>(fullCountDelta), full,
+           static_cast<unsigned long long>(peripheralCountDelta), peripheral);
+  return line;
+}
+
+void configureSerialDiagnosticsOutput() {
+#ifdef ENABLE_SERIAL_LOG
+  const char* debugTags[] = {
+      "NimBLE",
+      "NimBLEDevice",
+      "NimBLEServer",
+      "NimBLEAdvertising",
+      "NimBLECharacteristic",
+      "NimBLEService",
+      "NimBLEUtils",
+      "BTDM_INIT",
+      "BTDM_CONTROLLER",
+      "BT_HCI",
+      "BTDM",
+      "BT_BTM",
+      "BT_BTC",
+      "BT_APPL",
+  };
+  for (const char* tag : debugTags) {
+    esp_log_level_set(tag, ESP_LOG_DEBUG);
+  }
+
+  LOG_INF("COMP", "Serial diagnostics using standard serial setting; auto light sleep disabled");
+#ifdef CONFIG_NIMBLE_CPP_LOG_LEVEL
+  LOG_INF("COMP", "NimBLE C++ diagnostics compiled at level %d", CONFIG_NIMBLE_CPP_LOG_LEVEL);
+#endif
+#ifdef CONFIG_BT_NIMBLE_LOG_LEVEL
+  LOG_INF("COMP", "NimBLE host diagnostics compiled at level %d", CONFIG_BT_NIMBLE_LOG_LEVEL);
+#endif
+#endif
+}
 }  // namespace
 
 LaptopCompanionActivity::LaptopCompanionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
@@ -230,7 +334,11 @@ void LaptopCompanionActivity::restoreSerialLogOutput() {
 
 void LaptopCompanionActivity::onEnter() {
   Activity::onEnter();
-  quietSerialLogOutput();
+  if (COMPANION_SERIAL_DIAGNOSTICS_ENABLED) {
+    configureSerialDiagnosticsOutput();
+  } else {
+    quietSerialLogOutput();
+  }
   noHostConnectedSinceMs = 0;
   lastPowerDiagnosticAtMs = 0;
   lockViewState();
@@ -240,37 +348,62 @@ void LaptopCompanionActivity::onEnter() {
   viewState.cameraMessage = "Unknown";
   viewState.powerStatsMessage = powerManager.formatLightSleepStats();
   viewState.powerDeltaMessage = "Delta: +0 x, sleep 0ms / 0ms (0.0%)";
+  viewState.powerAccountingMessage = "Acct: baseline";
+  viewState.wakeCauseMessage = "Req: baseline";
   viewState.powerTimerMessage = "Timers: baseline";
-  hasLastRenderedViewState = false;
+  viewState.bleAdvertiseMessage = COMPANION_DISABLE_BLE_EXPERIMENT ? "BLEA: disabled experiment" : "BLEA: baseline";
+  viewState.bleConnectionMessage = COMPANION_DISABLE_BLE_EXPERIMENT ? "BLEC: disabled experiment" : "BLEC: baseline";
+  viewState.bleActivityMessage = COMPANION_DISABLE_BLE_EXPERIMENT ? "BLED: disabled experiment" : "BLED: baseline";
+  viewState.btLockTraceMessage = "BTLD: baseline";
+  viewState.powerTaskMessage = "PM1: baseline";
+  viewState.renderCostMessage = "PM2: baseline";
+  viewState.pmLockMessage3 = "PM3: baseline";
+  viewState.pmLockMessage4 = "PM4: baseline";
+  viewState.pmLockMessage5 = "PM5: baseline";
+  activePage = LaptopCompanionView::Page::Status;
   unlockViewState();
+  LaptopCompanionView::resetRenderCache();
   hasLastPowerDiagnosticStats = false;
+  hasLastPowerDiagnosticPmLockStats = false;
+  lastRenderDurationMs = 0;
 
   if (COMPANION_POWER_BUTTON_LIGHT_SLEEP_WAKE_ENABLED) {
     gpio.enableX3LightSleepPowerButtonWake(nullptr);
   }
-  if (!powerManager.configureAutoLightSleep(true)) {
+  if (COMPANION_SERIAL_DIAGNOSTICS_ENABLED) {
+    powerManager.configureAutoLightSleep(false);
+  } else if (!powerManager.configureAutoLightSleep(true)) {
     LOG_ERR("COMP", "Auto light sleep enable failed");
   }
 
-  auto& service = CompanionBleService::getInstance();
-  service.setStatusChangedCallback([this] { requestUpdate(); });
-  if (!service.begin()) {
+  if (COMPANION_DISABLE_BLE_EXPERIMENT) {
     lockViewState();
-    viewState.statusMessage = "BLE start failed";
+    viewState.statusMessage = "BLE disabled experiment";
     unlockViewState();
+    LOG_INF("COMP", "BLE/NimBLE startup skipped for sleep experiment");
   } else {
-    lockViewState();
-    viewState.statusMessage = service.getStatusText();
-    unlockViewState();
+    auto& service = CompanionBleService::getInstance();
+    service.setStatusChangedCallback([this] { requestUpdate(); });
+    if (!service.begin()) {
+      lockViewState();
+      viewState.statusMessage = "BLE start failed";
+      unlockViewState();
+    } else {
+      lockViewState();
+      viewState.statusMessage = service.getStatusText();
+      unlockViewState();
+    }
   }
-  updateNoHostTimer(service.isHostConnected());
+  updateNoHostTimer(false);
   updatePowerDiagnostics(true);
   requestUpdate();
 }
 
 void LaptopCompanionActivity::onExit() {
-  CompanionBleService::getInstance().setStatusChangedCallback(nullptr);
-  CompanionBleService::getInstance().end();
+  if (!COMPANION_DISABLE_BLE_EXPERIMENT) {
+    CompanionBleService::getInstance().setStatusChangedCallback(nullptr);
+    CompanionBleService::getInstance().end();
+  }
   if (COMPANION_POWER_BUTTON_LIGHT_SLEEP_WAKE_ENABLED) {
     gpio.disableX3LightSleepButtonWake();
   }
@@ -281,10 +414,12 @@ void LaptopCompanionActivity::onExit() {
 
 void LaptopCompanionActivity::loop() {
   auto& service = CompanionBleService::getInstance();
-  service.update();
+  if (!COMPANION_DISABLE_BLE_EXPERIMENT) {
+    service.update();
+  }
   updatePowerDiagnostics(false);
-  updateNoHostTimer(service.isHostConnected());
-  if (service.consumeStatusChanged()) {
+  updateNoHostTimer(!COMPANION_DISABLE_BLE_EXPERIMENT && service.isHostConnected());
+  if (!COMPANION_DISABLE_BLE_EXPERIMENT && service.consumeStatusChanged()) {
     const auto hostStatus = service.getHostStatus();
     lockViewState();
     viewState.hostConnected = service.isHostConnected();
@@ -300,10 +435,19 @@ void LaptopCompanionActivity::loop() {
     return;
   }
 
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    const bool sent = service.notifyToggleMuteReleased();
+  if (mappedInput.wasReleased(MappedInputManager::Button::Down)) {
     lockViewState();
-    viewState.statusMessage = sent ? "Mute button sent" : "Host not connected";
+    activePage = activePage == LaptopCompanionView::Page::Status ? LaptopCompanionView::Page::Diagnostics
+                                                                 : LaptopCompanionView::Page::Status;
+    unlockViewState();
+    requestUpdate();
+  }
+
+  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    const bool sent = !COMPANION_DISABLE_BLE_EXPERIMENT && service.notifyToggleMuteReleased();
+    lockViewState();
+    viewState.statusMessage =
+        COMPANION_DISABLE_BLE_EXPERIMENT ? "BLE disabled experiment" : (sent ? "Mute button sent" : "Host not connected");
     unlockViewState();
     requestUpdate();
   }
@@ -312,15 +456,28 @@ void LaptopCompanionActivity::loop() {
 }
 
 bool LaptopCompanionActivity::suppressAutoDeepSleep() {
+  if (COMPANION_SERIAL_DIAGNOSTICS_ENABLED) {
+    return true;
+  }
+  if (COMPANION_DISABLE_BLE_EXPERIMENT) {
+    return true;
+  }
   return shouldHoldWakeForCompanion();
 }
 
 bool LaptopCompanionActivity::preventAutoSleep() {
+  if (COMPANION_SERIAL_DIAGNOSTICS_ENABLED) {
+    return true;
+  }
+  if (COMPANION_DISABLE_BLE_EXPERIMENT) {
+    return true;
+  }
   return shouldHoldWakeForCompanion();
 }
 
 bool LaptopCompanionActivity::ownsPowerManagement() {
-  return powerManager.isAutoLightSleepConfigured() || CompanionBleService::getInstance().isRunning();
+  return COMPANION_SERIAL_DIAGNOSTICS_ENABLED || powerManager.isAutoLightSleepConfigured() ||
+         CompanionBleService::getInstance().isRunning();
 }
 
 void LaptopCompanionActivity::updateNoHostTimer(bool connected) {
@@ -343,22 +500,66 @@ void LaptopCompanionActivity::updatePowerDiagnostics(bool forceLog) {
     return;
   }
   const auto stats = powerManager.getLightSleepStats();
+  const auto pmLockStats = powerManager.getPmLockTimingStats();
   const std::string statsLine = formatPowerStatsLine(stats);
   const std::string deltaLine = formatPowerDeltaLine(stats, lastPowerDiagnosticStats, hasLastPowerDiagnosticStats);
+  const std::string accountingLine =
+      formatPowerAccountingLine(stats, lastPowerDiagnosticStats, hasLastPowerDiagnosticStats);
   const std::string wakeCauseLine =
       formatWakeCauseDeltaLine(stats, lastPowerDiagnosticStats, hasLastPowerDiagnosticStats);
   const std::string timerLine = powerManager.formatEspTimerActivity();
+  const std::string bleTiming =
+      COMPANION_DISABLE_BLE_EXPERIMENT ? "BLEA: disabled experiment\nBLEC: disabled experiment"
+                                       : CompanionBleService::getInstance().formatTimingDiagnostics();
+  const size_t bleLineBreak = bleTiming.find('\n');
+  const std::string bleAdvertiseLine =
+      bleLineBreak == std::string::npos ? bleTiming : bleTiming.substr(0, bleLineBreak);
+  const std::string bleConnectionLine =
+      bleLineBreak == std::string::npos ? "BLEC: unavailable" : bleTiming.substr(bleLineBreak + 1);
+  const std::string bleActivityLine =
+      COMPANION_DISABLE_BLE_EXPERIMENT ? "BLED: disabled experiment"
+                                       : CompanionBleService::getInstance().formatActivityDeltaDiagnostics();
+  const std::string btLockTraceLine = formatBtLockTraceDiagnostics();
+  std::string pmLockLine1;
+  std::string pmLockLine2;
+  std::string pmLockLine3;
+  std::string pmLockLine4;
+  std::string pmLockLine5;
+  powerManager.formatPmLockActivity(pmLockLine1, pmLockLine2, pmLockLine3, pmLockLine4, pmLockLine5);
 
   lockViewState();
   viewState.powerStatsMessage = statsLine;
   viewState.powerDeltaMessage = deltaLine;
+  viewState.powerAccountingMessage = accountingLine;
+  viewState.wakeCauseMessage = wakeCauseLine;
   viewState.powerTimerMessage = timerLine;
+  viewState.bleAdvertiseMessage = bleAdvertiseLine;
+  viewState.bleConnectionMessage = bleConnectionLine;
+  viewState.bleActivityMessage = bleActivityLine;
+  viewState.btLockTraceMessage = btLockTraceLine;
+  viewState.powerTaskMessage = pmLockLine1;
+  viewState.renderCostMessage = pmLockLine2;
+  viewState.pmLockMessage3 = pmLockLine3;
+  viewState.pmLockMessage4 = pmLockLine4;
+  viewState.pmLockMessage5 = pmLockLine5;
   unlockViewState();
 
   lastPowerDiagnosticStats = stats;
+  lastPowerDiagnosticPmLockStats = pmLockStats;
   hasLastPowerDiagnosticStats = true;
+  hasLastPowerDiagnosticPmLockStats = true;
   lastPowerDiagnosticAtMs = now;
+  LOG_INF("COMP", "%s", accountingLine.c_str());
   LOG_INF("COMP", "%s", wakeCauseLine.c_str());
+  LOG_INF("COMP", "%s", bleAdvertiseLine.c_str());
+  LOG_INF("COMP", "%s", bleConnectionLine.c_str());
+  LOG_INF("COMP", "%s", bleActivityLine.c_str());
+  LOG_INF("COMP", "%s", btLockTraceLine.c_str());
+  LOG_INF("COMP", "%s", pmLockLine1.c_str());
+  LOG_INF("COMP", "%s", pmLockLine2.c_str());
+  LOG_INF("COMP", "%s", pmLockLine3.c_str());
+  LOG_INF("COMP", "%s", pmLockLine4.c_str());
+  LOG_INF("COMP", "%s", pmLockLine5.c_str());
   powerManager.logLightSleepDiagnostics("laptop_companion");
   requestUpdate();
 }
@@ -381,23 +582,15 @@ bool LaptopCompanionActivity::shouldHoldWakeForCompanion() const {
 }
 
 void LaptopCompanionActivity::render(RenderLock&&) {
-  ViewState snapshot;
-  bool shouldSkipRender = false;
+  LaptopCompanionView::State snapshot;
+  LaptopCompanionView::Page snapshotPage;
   lockViewState();
   snapshot = viewState;
-  shouldSkipRender = hasLastRenderedViewState && snapshot == lastRenderedViewState;
-  if (!shouldSkipRender) {
-    lastRenderedViewState = snapshot;
-    hasLastRenderedViewState = true;
-  }
+  snapshotPage = activePage;
   unlockViewState();
 
-  if (shouldSkipRender) {
-    LOG_DBG("COMP", "Render skipped; view state unchanged");
-    return;
+  const unsigned long renderStartMs = millis();
+  if (LaptopCompanionView::renderIfChanged(renderer, mappedInput, snapshotPage, snapshot)) {
+    lastRenderDurationMs = millis() - renderStartMs;
   }
-
-  LaptopCompanionView::render(renderer, mappedInput, snapshot.hostConnected, snapshot.statusMessage,
-                              snapshot.microphoneMessage, snapshot.cameraMessage, snapshot.powerStatsMessage,
-                              snapshot.powerDeltaMessage, snapshot.powerTimerMessage);
 }
