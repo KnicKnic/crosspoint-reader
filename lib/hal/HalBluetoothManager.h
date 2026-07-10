@@ -11,10 +11,14 @@ class HalBluetoothManager {
   void disable();
 
   bool isEnabled() const { return enabled; }
+  bool isModemSleepEnabled() const { return modemSleepEnabled; }
+  bool isControllerSleeping() const;
+  std::string formatPowerState() const;
   const std::string& getLastError() const { return lastError; }
 
  private:
   bool enabled = false;
+  bool modemSleepEnabled = false;
   std::string lastError;
 };
 

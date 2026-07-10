@@ -3,6 +3,9 @@
 #include <BluetoothDiagnostics.h>
 #include <Logging.h>
 #include <NimBLEDevice.h>
+#include <esp_bt.h>
+
+#include <cstdio>
 
 HalBluetoothManager bluetoothManager;
 
@@ -22,6 +25,19 @@ bool HalBluetoothManager::enable(const char* deviceName) {
     return false;
   }
 
+#if defined(CONFIG_BT_CTRL_MODEM_SLEEP) && CONFIG_BT_CTRL_MODEM_SLEEP
+  const esp_err_t sleepErr = esp_bt_sleep_enable();
+  if (sleepErr == ESP_OK) {
+    modemSleepEnabled = true;
+    BluetoothDiagnostics::record("bluetooth_modem_sleep_enabled");
+    LOG_INF("BT", "Bluetooth modem sleep enabled");
+  } else {
+    modemSleepEnabled = false;
+    LOG_ERR("BT", "Failed to enable Bluetooth modem sleep: %d", sleepErr);
+    BluetoothDiagnostics::recordf("bluetooth_modem_sleep_enable_failed", "err=%d", sleepErr);
+  }
+#endif
+
   enabled = true;
   BluetoothDiagnostics::record("bluetooth_enabled");
   LOG_INF("BT", "Bluetooth stack enabled as %s", resolvedName);
@@ -34,6 +50,16 @@ void HalBluetoothManager::disable() {
   }
 
   NimBLEDevice::stopAdvertising();
+#if defined(CONFIG_BT_CTRL_MODEM_SLEEP) && CONFIG_BT_CTRL_MODEM_SLEEP
+  if (modemSleepEnabled) {
+    const esp_err_t sleepErr = esp_bt_sleep_disable();
+    if (sleepErr != ESP_OK) {
+      LOG_ERR("BT", "Failed to disable Bluetooth modem sleep: %d", sleepErr);
+      BluetoothDiagnostics::recordf("bluetooth_modem_sleep_disable_failed", "err=%d", sleepErr);
+    }
+    modemSleepEnabled = false;
+  }
+#endif
   if (!NimBLEDevice::deinit(true)) {
     lastError = "NimBLE deinit failed";
     LOG_ERR("BT", "Failed to deinitialize Bluetooth stack");
@@ -45,4 +71,24 @@ void HalBluetoothManager::disable() {
   lastError.clear();
   BluetoothDiagnostics::record("bluetooth_disabled");
   LOG_INF("BT", "Bluetooth stack disabled");
+}
+
+bool HalBluetoothManager::isControllerSleeping() const {
+#if defined(CONFIG_BT_CTRL_MODEM_SLEEP) && CONFIG_BT_CTRL_MODEM_SLEEP
+  return enabled && modemSleepEnabled && esp_bt_controller_is_sleeping();
+#else
+  return false;
+#endif
+}
+
+std::string HalBluetoothManager::formatPowerState() const {
+  char buf[96];
+#if defined(CONFIG_BT_CTRL_MODEM_SLEEP) && CONFIG_BT_CTRL_MODEM_SLEEP
+  const int lpclk = enabled ? static_cast<int>(esp_bt_get_lpclk_src()) : -1;
+  snprintf(buf, sizeof(buf), "BT power enabled=%d modem_sleep=%d controller_sleeping=%d lpclk=%d", enabled,
+           modemSleepEnabled, isControllerSleeping(), lpclk);
+#else
+  snprintf(buf, sizeof(buf), "BT power enabled=%d modem_sleep=unsupported controller_sleeping=0 lpclk=-1", enabled);
+#endif
+  return buf;
 }

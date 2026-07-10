@@ -1,5 +1,6 @@
 #include "HalClock.h"
 
+#include <HalPowerManager.h>
 #include <Logging.h>
 #include <WiFi.h>
 #include <esp_sntp.h>
@@ -25,6 +26,7 @@ void HalClock::begin() {
 
   // I2C is already initialised by HalPowerManager::begin() for X3.
   // Probe the DS3231 by reading the seconds register.
+  HalPowerManager::PeripheralLock peripheralLock;
   Wire.beginTransmission(I2C_ADDR_DS3231);
   Wire.write(DS3231_SEC_REG);
   if (Wire.endTransmission(false) != 0) {
@@ -91,6 +93,7 @@ bool HalClock::getDate(uint16_t& year, uint8_t& month, uint8_t& day) const {
 bool HalClock::readDateTimeFromRTC() const {
   const unsigned long now = millis();
 
+  HalPowerManager::PeripheralLock peripheralLock;
   Wire.beginTransmission(I2C_ADDR_DS3231);
   Wire.write(DS3231_SEC_REG);
   if (Wire.endTransmission(false) != 0) {
@@ -198,6 +201,7 @@ bool HalClock::writeDateTimeToRTC(uint16_t year, uint8_t month, uint8_t day, uin
   const bool century = year >= 2100;
   const uint8_t dsYear = static_cast<uint8_t>(year % 100);
 
+  HalPowerManager::PeripheralLock peripheralLock;
   Wire.beginTransmission(I2C_ADDR_DS3231);
   Wire.write(DS3231_SEC_REG);    // Start at register 0x00
   Wire.write(decToBcd(second));  // 0x00: Seconds

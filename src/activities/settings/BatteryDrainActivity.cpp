@@ -121,6 +121,7 @@ bool BatteryDrainActivity::readBQ27220U16(uint8_t reg, uint16_t& value) const {
     return false;
   }
 
+  HalPowerManager::PeripheralLock peripheralLock;
   Wire.beginTransmission(I2C_ADDR_BQ27220);
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) {

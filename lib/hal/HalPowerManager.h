@@ -5,9 +5,12 @@
 #include <InputManager.h>
 #include <Logging.h>
 #include <Wire.h>
+#include <esp_pm.h>
 #include <freertos/semphr.h>
 
 #include <cassert>
+#include <cstdint>
+#include <string>
 
 #include "HalGPIO.h"
 
@@ -26,8 +29,30 @@ class HalPowerManager {
   enum LockMode { None, NormalSpeed };
   LockMode currentLockMode = None;
   SemaphoreHandle_t modeMutex = nullptr;  // Protect access to currentLockMode
+  esp_pm_config_t savedPmConfig = {};
+  bool savedPmConfigValid = false;
+  bool autoLightSleepConfigured = false;
+  esp_pm_lock_handle_t cpuMaxLock = nullptr;
+  esp_pm_lock_handle_t apbMaxLock = nullptr;
+  esp_pm_lock_handle_t noLightSleepLock = nullptr;
+
+  bool ensurePmLocks();
 
  public:
+  static constexpr uint8_t LIGHT_SLEEP_WAKE_CAUSE_COUNT = 18;
+  static constexpr uint8_t LIGHT_SLEEP_WAKE_CAUSE_UNKNOWN_INDEX = LIGHT_SLEEP_WAKE_CAUSE_COUNT - 1;
+  static constexpr uint8_t LIGHT_SLEEP_REQUEST_BUCKET_COUNT = 6;
+
+  struct LightSleepStats {
+    uint32_t enterCount = 0;
+    uint64_t sleptUs = 0;
+    uint64_t requestedUs = 0;
+    uint64_t uptimeUs = 0;
+    uint64_t earlyWakeCount = 0;
+    uint64_t wakeCauseCounts[LIGHT_SLEEP_WAKE_CAUSE_COUNT] = {};
+    uint64_t requestBucketCounts[LIGHT_SLEEP_REQUEST_BUCKET_COUNT] = {};
+  };
+
   static constexpr int LOW_POWER_FREQ = 10;                    // MHz
   static constexpr unsigned long IDLE_POWER_SAVING_MS = 3000;  // ms
   static constexpr unsigned long BATTERY_POLL_MS = 1500;       // ms
@@ -36,6 +61,17 @@ class HalPowerManager {
 
   // Control CPU frequency for power saving
   void setPowerSaving(bool enabled);
+
+  // Configure IDF automatic light sleep. Intended for scoped use by activities
+  // that keep radio tasks alive and can tolerate idle-task sleep.
+  bool configureAutoLightSleep(bool enabled);
+  bool isAutoLightSleepConfigured() const { return autoLightSleepConfigured; }
+  LightSleepStats getLightSleepStats() const;
+  std::string formatLightSleepStats() const;
+  std::string formatEspTimerActivity() const;
+  void logLightSleepDiagnostics(const char* reason) const;
+  static const char* lightSleepWakeCauseName(uint8_t causeIndex);
+  static const char* lightSleepRequestBucketName(uint8_t bucketIndex);
 
   // Setup wake up GPIO and enter deep sleep
   // Should be called inside main loop() to handle the currentLockMode
@@ -50,6 +86,9 @@ class HalPowerManager {
   class Lock {
     friend class HalPowerManager;
     bool valid = false;
+    bool cpuLockAcquired = false;
+    bool apbLockAcquired = false;
+    bool noLightSleepLockAcquired = false;
 
    public:
     explicit Lock();
@@ -60,5 +99,22 @@ class HalPowerManager {
     Lock& operator=(const Lock&) = delete;
     Lock(Lock&&) = delete;
     Lock& operator=(Lock&&) = delete;
+  };
+
+  // Keeps APB-backed peripherals stable and prevents automatic light sleep
+  // while a short transaction is in progress.
+  class PeripheralLock {
+    friend class HalPowerManager;
+    bool apbLockAcquired = false;
+    bool noLightSleepLockAcquired = false;
+
+   public:
+    explicit PeripheralLock();
+    ~PeripheralLock();
+
+    PeripheralLock(const PeripheralLock&) = delete;
+    PeripheralLock& operator=(const PeripheralLock&) = delete;
+    PeripheralLock(PeripheralLock&&) = delete;
+    PeripheralLock& operator=(PeripheralLock&&) = delete;
   };
 };

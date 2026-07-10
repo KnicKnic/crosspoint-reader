@@ -1,6 +1,7 @@
 #include "LaptopCompanionView.h"
 
 #include <GfxRenderer.h>
+#include <HalPowerManager.h>
 #include <I18n.h>
 
 #include "MappedInputManager.h"
@@ -22,7 +23,9 @@ const char* triStateText(uint8_t state, const char* offText, const char* onText)
 
 void render(GfxRenderer& renderer, MappedInputManager& mappedInput, bool hostConnected,
             const std::string& statusMessage, const std::string& microphoneMessage,
-            const std::string& cameraMessage) {
+            const std::string& cameraMessage, const std::string& powerStatsMessage,
+            const std::string& powerDeltaMessage, const std::string& powerTimerMessage) {
+  HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
   const auto& metrics = UITheme::getInstance().getMetrics();
   const int pageWidth = renderer.getScreenWidth();
   const int contentX = metrics.contentSidePadding;
@@ -54,6 +57,18 @@ void render(GfxRenderer& renderer, MappedInputManager& mappedInput, bool hostCon
     renderer.drawText(SMALL_FONT_ID, contentX, y, line.c_str());
     y += renderer.getLineHeight(SMALL_FONT_ID);
   }
+  y += 8;
+
+  const auto powerStatsLine = renderer.truncatedText(SMALL_FONT_ID, powerStatsMessage.c_str(), contentWidth);
+  renderer.drawText(SMALL_FONT_ID, contentX, y, powerStatsLine.c_str(), true, EpdFontFamily::BOLD);
+  y += renderer.getLineHeight(SMALL_FONT_ID);
+
+  const auto powerDeltaLine = renderer.truncatedText(SMALL_FONT_ID, powerDeltaMessage.c_str(), contentWidth);
+  renderer.drawText(SMALL_FONT_ID, contentX, y, powerDeltaLine.c_str(), true, EpdFontFamily::BOLD);
+  y += renderer.getLineHeight(SMALL_FONT_ID);
+
+  const auto powerTimerLine = renderer.truncatedText(SMALL_FONT_ID, powerTimerMessage.c_str(), contentWidth);
+  renderer.drawText(SMALL_FONT_ID, contentX, y, powerTimerLine.c_str(), true, EpdFontFamily::BOLD);
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_TOGGLE), "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);

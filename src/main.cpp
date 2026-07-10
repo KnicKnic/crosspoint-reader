@@ -503,6 +503,7 @@ void loop() {
 
   renderer.setFadingFix(SETTINGS.fadingFix);
   const bool activityOwnsPowerManagement = activityManager.ownsPowerManagement();
+  const bool activitySuppressesAutoDeepSleep = activityManager.suppressAutoDeepSleep();
 
   if (SETTINGS.serialLoggingEnabled && isSerialLogOutputEnabled() && Serial && millis() - lastMemPrint >= 10000) {
     LOG_INF("MEM", "Free: %d bytes, Total: %d bytes, Min Free: %d bytes, MaxAlloc: %d bytes", ESP.getFreeHeap(),
@@ -562,7 +563,7 @@ void loop() {
   }
 
   const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
-  if (!activityOwnsPowerManagement && sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
+  if (!activitySuppressesAutoDeepSleep && sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
     LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
     enterDeepSleep(true);
     // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start

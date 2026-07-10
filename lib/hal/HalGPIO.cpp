@@ -1,4 +1,5 @@
 #include <HalGPIO.h>
+#include <HalPowerManager.h>
 #include <Logging.h>
 #include <Preferences.h>
 #include <SPI.h>
@@ -21,6 +22,7 @@ struct X3ProbeResult {
 };
 
 bool readI2CReg8(uint8_t addr, uint8_t reg, uint8_t* outValue) {
+  HalPowerManager::PeripheralLock peripheralLock;
   Wire.beginTransmission(addr);
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) {
@@ -34,6 +36,7 @@ bool readI2CReg8(uint8_t addr, uint8_t reg, uint8_t* outValue) {
 }
 
 bool readI2CReg16LE(uint8_t addr, uint8_t reg, uint16_t* outValue) {
+  HalPowerManager::PeripheralLock peripheralLock;
   Wire.beginTransmission(addr);
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) {
@@ -235,6 +238,88 @@ void HalGPIO::startDeepSleep() {
   esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
   // Enter Deep Sleep
   esp_deep_sleep_start();
+}
+
+
+void HalGPIO::enableX3LightSleepButtonWake(void (*interruptHandler)()) {
+  if (!deviceIsX3() || x3LightSleepButtonWakeEnabled) {
+    return;
+  }
+
+  gpio_wakeup_disable(GPIO_NUM_1);
+  gpio_wakeup_disable(GPIO_NUM_2);
+  gpio_wakeup_disable(GPIO_NUM_3);
+
+  pinMode(InputManager::BUTTON_ADC_PIN_1, INPUT_PULLUP);
+  pinMode(InputManager::BUTTON_ADC_PIN_2, INPUT_PULLUP);
+  pinMode(InputManager::POWER_BUTTON_PIN, INPUT_PULLUP);
+
+  const esp_err_t gpio1Err = gpio_wakeup_enable(GPIO_NUM_1, GPIO_INTR_LOW_LEVEL);
+  const esp_err_t gpio2Err = gpio_wakeup_enable(GPIO_NUM_2, GPIO_INTR_LOW_LEVEL);
+  const esp_err_t gpio3Err = gpio_wakeup_enable(GPIO_NUM_3, GPIO_INTR_LOW_LEVEL);
+  const esp_err_t wakeErr = esp_sleep_enable_gpio_wakeup();
+
+  if (gpio1Err != ESP_OK || gpio2Err != ESP_OK || gpio3Err != ESP_OK || wakeErr != ESP_OK) {
+    LOG_ERR("GPIO", "X3 light sleep wake setup failed g1=%d g2=%d g3=%d w=%d", gpio1Err, gpio2Err, gpio3Err, wakeErr);
+    gpio_wakeup_disable(GPIO_NUM_1);
+    gpio_wakeup_disable(GPIO_NUM_2);
+    gpio_wakeup_disable(GPIO_NUM_3);
+    return;
+  }
+
+  if (interruptHandler) {
+    attachInterrupt(digitalPinToInterrupt(InputManager::BUTTON_ADC_PIN_1), interruptHandler, FALLING);
+    attachInterrupt(digitalPinToInterrupt(InputManager::BUTTON_ADC_PIN_2), interruptHandler, FALLING);
+    attachInterrupt(digitalPinToInterrupt(InputManager::POWER_BUTTON_PIN), interruptHandler, FALLING);
+  }
+
+  x3LightSleepButtonWakeEnabled = true;
+}
+
+void HalGPIO::enableX3LightSleepPowerButtonWake(void (*interruptHandler)()) {
+  if (!deviceIsX3() || x3LightSleepButtonWakeEnabled) {
+    return;
+  }
+
+  gpio_wakeup_disable(GPIO_NUM_1);
+  gpio_wakeup_disable(GPIO_NUM_2);
+  gpio_wakeup_disable(GPIO_NUM_3);
+
+  pinMode(InputManager::BUTTON_ADC_PIN_1, INPUT);
+  pinMode(InputManager::BUTTON_ADC_PIN_2, INPUT);
+  pinMode(InputManager::POWER_BUTTON_PIN, INPUT_PULLUP);
+
+  const esp_err_t gpio3Err = gpio_wakeup_enable(GPIO_NUM_3, GPIO_INTR_LOW_LEVEL);
+  const esp_err_t wakeErr = esp_sleep_enable_gpio_wakeup();
+
+  if (gpio3Err != ESP_OK || wakeErr != ESP_OK) {
+    LOG_ERR("GPIO", "X3 power light sleep wake setup failed g3=%d w=%d", gpio3Err, wakeErr);
+    gpio_wakeup_disable(GPIO_NUM_3);
+    return;
+  }
+
+  if (interruptHandler) {
+    attachInterrupt(digitalPinToInterrupt(InputManager::POWER_BUTTON_PIN), interruptHandler, FALLING);
+  }
+
+  x3LightSleepButtonWakeEnabled = true;
+}
+
+void HalGPIO::disableX3LightSleepButtonWake() {
+  if (!x3LightSleepButtonWakeEnabled) {
+    return;
+  }
+
+  detachInterrupt(digitalPinToInterrupt(InputManager::BUTTON_ADC_PIN_1));
+  detachInterrupt(digitalPinToInterrupt(InputManager::BUTTON_ADC_PIN_2));
+  detachInterrupt(digitalPinToInterrupt(InputManager::POWER_BUTTON_PIN));
+
+  gpio_wakeup_disable(GPIO_NUM_1);
+  gpio_wakeup_disable(GPIO_NUM_2);
+  gpio_wakeup_disable(GPIO_NUM_3);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+
+  x3LightSleepButtonWakeEnabled = false;
 }
 
 void HalGPIO::verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPressAllowed) {

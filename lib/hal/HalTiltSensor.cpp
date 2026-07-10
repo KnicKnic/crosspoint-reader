@@ -1,10 +1,12 @@
 #include "HalTiltSensor.h"
 
+#include <HalPowerManager.h>
 #include <Logging.h>
 
 HalTiltSensor halTiltSensor;  // Singleton instance
 
 bool HalTiltSensor::writeReg(uint8_t reg, uint8_t val) const {
+  HalPowerManager::PeripheralLock peripheralLock;
   Wire.beginTransmission(_i2cAddr);
   Wire.write(reg);
   Wire.write(val);
@@ -12,6 +14,7 @@ bool HalTiltSensor::writeReg(uint8_t reg, uint8_t val) const {
 }
 
 bool HalTiltSensor::readReg(uint8_t reg, uint8_t* val) const {
+  HalPowerManager::PeripheralLock peripheralLock;
   Wire.beginTransmission(_i2cAddr);
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) {
@@ -26,6 +29,7 @@ bool HalTiltSensor::readReg(uint8_t reg, uint8_t* val) const {
 }
 
 bool HalTiltSensor::readGyro(float& gx, float& gy, float& gz) const {
+  HalPowerManager::PeripheralLock peripheralLock;
   Wire.beginTransmission(_i2cAddr);
   Wire.write(REG_GX_L);  // Start reading at Gyro X Low
   if (Wire.endTransmission(false) != 0) {

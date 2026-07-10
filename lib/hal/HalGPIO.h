@@ -51,6 +51,7 @@ class HalGPIO {
 
  private:
   DeviceType _deviceType = DeviceType::X4;
+  bool x3LightSleepButtonWakeEnabled = false;
 
  public:
   HalGPIO() = default;
@@ -74,6 +75,11 @@ class HalGPIO {
 
   // Setup wake up GPIO and enter deep sleep
   void startDeepSleep();
+
+  // Configure X3 button GPIOs as automatic light-sleep wake sources.
+  void enableX3LightSleepButtonWake(void (*interruptHandler)());
+  void enableX3LightSleepPowerButtonWake(void (*interruptHandler)());
+  void disableX3LightSleepButtonWake();
 
   // Verify power button was held long enough after wakeup.
   // If verification fails, enters deep sleep and does not return.

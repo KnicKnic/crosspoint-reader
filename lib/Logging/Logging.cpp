@@ -17,7 +17,14 @@ RTC_NOINIT_ATTR uint32_t rtcLogMagic;
 static constexpr uint32_t LOG_RTC_MAGIC = 0xDEADBEEF;
 static bool serialLogOutputEnabled = true;
 
-void setSerialLogOutputEnabled(bool enabled) { serialLogOutputEnabled = enabled; }
+void setSerialLogOutputEnabled(bool enabled) {
+#ifdef ENABLE_SERIAL_LOG
+  if (serialLogOutputEnabled && !enabled && logSerial) {
+    logSerial.flush();
+  }
+#endif
+  serialLogOutputEnabled = enabled;
+}
 
 bool isSerialLogOutputEnabled() { return serialLogOutputEnabled; }
 

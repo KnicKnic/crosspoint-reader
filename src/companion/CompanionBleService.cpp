@@ -32,6 +32,8 @@ constexpr uint16_t BLE_CONN_INTERVAL_IDLE_MIN = 240;       // 300 ms
 constexpr uint16_t BLE_CONN_INTERVAL_IDLE_MAX = 400;       // 500 ms
 constexpr uint16_t BLE_CONN_LATENCY_IDLE = 2;
 constexpr uint16_t BLE_CONN_TIMEOUT_IDLE = 1000;           // 10 s
+constexpr uint16_t BLE_ADV_INTERVAL_LOW_POWER_MIN = 800;   // 500 ms
+constexpr uint16_t BLE_ADV_INTERVAL_LOW_POWER_MAX = 1600;  // 1000 ms
 
 enum class HostStateField : uint8_t {
   Teams,
@@ -270,6 +272,8 @@ bool CompanionBleService::begin() {
   advertising->clearData();
   advertising->enableScanResponse(true);
   advertising->addServiceUUID(CompanionProtocol::SERVICE_UUID);
+  advertising->setMinInterval(BLE_ADV_INTERVAL_LOW_POWER_MIN);
+  advertising->setMaxInterval(BLE_ADV_INTERVAL_LOW_POWER_MAX);
   advertising->setPreferredParams(BLE_CONN_INTERVAL_IDLE_MIN, BLE_CONN_INTERVAL_IDLE_MAX);
   advertising->setName("X3 Companion");
   if (!advertising->start()) {
