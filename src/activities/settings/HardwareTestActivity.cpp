@@ -6,6 +6,9 @@
 #include <HalTiltSensor.h>
 #include <InputManager.h>
 #include <Logging.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <cstdio>
 #include <cstdarg>
@@ -18,12 +21,70 @@
 
 namespace {
 constexpr uint64_t LIGHT_SLEEP_TIMEOUT_US = 10ULL * 1000ULL * 1000ULL;
+constexpr uint32_t AUTO_LIGHT_SLEEP_BLOCK_MS = 30UL * 1000UL;
 constexpr unsigned long REFRESH_INTERVAL_MS = 350;
 constexpr unsigned long MOTION_TEST_SETTLE_MS = 2500;
 constexpr gpio_num_t X3_BATTERY_LATCH_PIN = GPIO_NUM_13;
+constexpr uint32_t AUTO_LIGHT_SLEEP_BUTTON_NOTIFY = 0x01;
+
+volatile TaskHandle_t autoLightSleepWaitTask = nullptr;
+
+void IRAM_ATTR autoLightSleepButtonInterrupt() {
+  TaskHandle_t task = autoLightSleepWaitTask;
+  if (!task) {
+    return;
+  }
+
+  autoLightSleepWaitTask = nullptr;
+  BaseType_t higherPriorityTaskWoken = pdFALSE;
+  xTaskNotifyFromISR(task, AUTO_LIGHT_SLEEP_BUTTON_NOTIFY, eSetBits, &higherPriorityTaskWoken);
+  if (higherPriorityTaskWoken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
+}
+
+esp_err_t enableAutoLightSleepButtonWakeForTest() {
+  if (!gpio.deviceIsX3()) {
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+
+  gpio_wakeup_disable(GPIO_NUM_1);
+  gpio_wakeup_disable(GPIO_NUM_2);
+  gpio_wakeup_disable(GPIO_NUM_3);
+
+  pinMode(InputManager::BUTTON_ADC_PIN_1, INPUT_PULLUP);
+  pinMode(InputManager::BUTTON_ADC_PIN_2, INPUT_PULLUP);
+  pinMode(InputManager::POWER_BUTTON_PIN, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(InputManager::BUTTON_ADC_PIN_1), autoLightSleepButtonInterrupt, ONLOW_WE);
+  attachInterrupt(digitalPinToInterrupt(InputManager::BUTTON_ADC_PIN_2), autoLightSleepButtonInterrupt, ONLOW_WE);
+  attachInterrupt(digitalPinToInterrupt(InputManager::POWER_BUTTON_PIN), autoLightSleepButtonInterrupt, ONLOW_WE);
+
+  return esp_sleep_enable_gpio_wakeup();
+}
+
+void disableAutoLightSleepButtonWakeForTest() {
+  detachInterrupt(digitalPinToInterrupt(InputManager::BUTTON_ADC_PIN_1));
+  detachInterrupt(digitalPinToInterrupt(InputManager::BUTTON_ADC_PIN_2));
+  detachInterrupt(digitalPinToInterrupt(InputManager::POWER_BUTTON_PIN));
+
+  gpio_wakeup_disable(GPIO_NUM_1);
+  gpio_wakeup_disable(GPIO_NUM_2);
+  gpio_wakeup_disable(GPIO_NUM_3);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+}
 
 const char* rawButtonName(uint8_t idx) {
   return InputManager::getButtonName(idx);
+}
+
+bool anyButtonPressed() {
+  for (uint8_t idx = HalGPIO::BTN_BACK; idx <= HalGPIO::BTN_POWER; ++idx) {
+    if (gpio.isPressed(idx)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void debugSerialPrintln(const char* text = "") {
@@ -78,6 +139,9 @@ void HardwareTestActivity::onEnter() {
   lastRefreshMs = 0;
   lastButtonEvent = "None";
   lastSleepReport = "No sleep test yet";
+  lastSleepStatsLine1.clear();
+  lastSleepStatsLine2.clear();
+  lastSleepStatsLine3.clear();
   sleepPromptVisible = false;
   halTiltSensor.wake();
   requestUpdate();
@@ -157,21 +221,24 @@ void HardwareTestActivity::loop() {
         runTimerOnlyLightSleepTest();
         break;
       case 2:
-        runTimerNoLatchLightSleepTest();
+        runAutoLightSleepBlockTest();
         break;
       case 3:
-        runGpio1LightSleepTest();
+        runTimerNoLatchLightSleepTest();
         break;
       case 4:
-        runGpio2LightSleepTest();
+        runGpio1LightSleepTest();
         break;
       case 5:
-        runPowerButtonLightSleepTest();
+        runGpio2LightSleepTest();
         break;
       case 6:
-        runGyroLightSleepTest();
+        runPowerButtonLightSleepTest();
         break;
       case 7:
+        runGyroLightSleepTest();
+        break;
+      case 8:
         runGyroInterruptScan();
         break;
       default:
@@ -188,6 +255,118 @@ void HardwareTestActivity::loop() {
 void HardwareTestActivity::runTimerOnlyLightSleepTest() {
   sleepPrompt = "Sleeping: timer only";
   runLightSleepTest("Timer-only wake", GPIO_NUM_NC, GPIO_INTR_DISABLE, LIGHT_SLEEP_TIMEOUT_US, false);
+}
+
+void HardwareTestActivity::runAutoLightSleepBlockTest() {
+  LOG_INF("HWT", "Starting auto light sleep block test");
+  debugSerialPrintf("HWT_AUTO_LS_START:timeout_ms=%lu\n", static_cast<unsigned long>(AUTO_LIGHT_SLEEP_BLOCK_MS));
+  debugSerialFlush();
+
+  powerManager.setPowerSaving(false);
+  sleepPromptVisible = true;
+  sleepPrompt = "Release buttons";
+  requestUpdateAndWait();
+
+  while (anyButtonPressed()) {
+    gpio.update();
+    delay(20);
+  }
+  delay(80);
+  gpio.update();
+
+  sleepPrompt = "Auto LS: press button or wait 30s";
+  requestUpdateAndWait();
+  delay(150);
+
+#ifdef ENABLE_SERIAL_LOG
+  const bool previousSerialLogOutputEnabled = isSerialLogOutputEnabled();
+  if (logSerial) {
+    logSerial.flush();
+  }
+  setSerialLogOutputEnabled(false);
+  if (logSerial) {
+    logSerial.flush();
+    logSerial.end();
+  }
+#else
+  const bool previousSerialLogOutputEnabled = false;
+#endif
+
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  const esp_err_t buttonWakeErr = enableAutoLightSleepButtonWakeForTest();
+
+  uint32_t discardedNotifyBits = 0;
+  xTaskNotifyWait(UINT32_MAX, UINT32_MAX, &discardedNotifyBits, 0);
+  autoLightSleepWaitTask = xTaskGetCurrentTaskHandle();
+
+  const auto before = powerManager.getLightSleepStats();
+  const int64_t startUsSigned = esp_timer_get_time();
+
+  bool autoLightSleepEnabled = buttonWakeErr == ESP_OK && powerManager.configureAutoLightSleep(true);
+  uint32_t notifyBits = 0;
+  BaseType_t notified = pdFALSE;
+  if (autoLightSleepEnabled) {
+    notified = xTaskNotifyWait(0, UINT32_MAX, &notifyBits, pdMS_TO_TICKS(AUTO_LIGHT_SLEEP_BLOCK_MS));
+  }
+
+  const int64_t endUsSigned = esp_timer_get_time();
+  const auto after = powerManager.getLightSleepStats();
+
+  autoLightSleepWaitTask = nullptr;
+  disableAutoLightSleepButtonWakeForTest();
+  powerManager.configureAutoLightSleep(false);
+  powerManager.setPowerSaving(false);
+  gpio.update();
+
+#ifdef ENABLE_SERIAL_LOG
+  if (previousSerialLogOutputEnabled) {
+    logSerial.begin(115200);
+    logSerial.setTxTimeoutMs(1);
+  }
+  setSerialLogOutputEnabled(previousSerialLogOutputEnabled);
+#else
+  (void)previousSerialLogOutputEnabled;
+#endif
+
+  const uint64_t elapsedUs =
+      endUsSigned > startUsSigned ? static_cast<uint64_t>(endUsSigned - startUsSigned) : 0ULL;
+  const uint64_t sleptUs = after.sleptUs >= before.sleptUs ? after.sleptUs - before.sleptUs : 0ULL;
+  const uint64_t awakeUs = elapsedUs > sleptUs ? elapsedUs - sleptUs : 0ULL;
+  const uint32_t sleepEntries = after.enterCount >= before.enterCount ? after.enterCount - before.enterCount : 0;
+  const uint64_t earlyWakeCount =
+      after.earlyWakeCount >= before.earlyWakeCount ? after.earlyWakeCount - before.earlyWakeCount : 0ULL;
+
+  char buf[192];
+  if (!autoLightSleepEnabled) {
+    snprintf(buf, sizeof(buf), "Auto LS setup failed wake=%d", static_cast<int>(buttonWakeErr));
+    lastSleepStatsLine1.clear();
+    lastSleepStatsLine2.clear();
+    lastSleepStatsLine3.clear();
+  } else {
+    const char* wakeText = notified == pdTRUE ? "button" : "30s timer";
+    const uint64_t sleptPercentTenths = elapsedUs > 0 ? (sleptUs * 1000ULL) / elapsedUs : 0ULL;
+    snprintf(buf, sizeof(buf), "Auto LS woke by %s", wakeText);
+
+    char line[96];
+    snprintf(line, sizeof(line), "Elapsed: %llums", static_cast<unsigned long long>(elapsedUs / 1000ULL));
+    lastSleepStatsLine1 = line;
+    snprintf(line, sizeof(line), "Slept: %llums  Awake: %llums",
+             static_cast<unsigned long long>(sleptUs / 1000ULL),
+             static_cast<unsigned long long>(awakeUs / 1000ULL));
+    lastSleepStatsLine2 = line;
+    snprintf(line, sizeof(line), "Sleep: %llu.%01llu%%  Entries: +%lu  Early: +%llu",
+             static_cast<unsigned long long>(sleptPercentTenths / 10ULL),
+             static_cast<unsigned long long>(sleptPercentTenths % 10ULL), static_cast<unsigned long>(sleepEntries),
+             static_cast<unsigned long long>(earlyWakeCount));
+    lastSleepStatsLine3 = line;
+  }
+  lastSleepReport = buf;
+
+  sleepPromptVisible = false;
+  LOG_INF("HWT", "%s", lastSleepReport.c_str());
+  debugSerialPrintf("HWT_AUTO_LS_END:%s\n", lastSleepReport.c_str());
+  debugSerialFlush();
+  requestUpdateAndWait();
 }
 
 void HardwareTestActivity::runTimerNoLatchLightSleepTest() {
@@ -235,6 +414,9 @@ void HardwareTestActivity::runGyroLightSleepTest() {
 }
 
 void HardwareTestActivity::runGyroInterruptScan() {
+  lastSleepStatsLine1.clear();
+  lastSleepStatsLine2.clear();
+  lastSleepStatsLine3.clear();
   sleepPrompt = "Release buttons; hold still";
   sleepPromptVisible = true;
   requestUpdateAndWait();
@@ -331,6 +513,9 @@ void HardwareTestActivity::scanGyroInterruptRoute(bool useInt1, unsigned long du
 
 void HardwareTestActivity::runLightSleepTest(const char* label, gpio_num_t wakePin, gpio_int_type_t wakeLevel,
                                              uint64_t timeoutUs, bool enableGpioWake, bool holdLatchDuringSleep) {
+  lastSleepStatsLine1.clear();
+  lastSleepStatsLine2.clear();
+  lastSleepStatsLine3.clear();
   LOG_INF("HWT", "Starting light sleep test: %s pin=%d level=%d gpio=%d", label, static_cast<int>(wakePin),
           static_cast<int>(wakeLevel), enableGpioWake);
   debugSerialPrintf("HWT_SLEEP_START:%s pin=%d gpio=%d timeout_us=%llu\n", label, static_cast<int>(wakePin),
@@ -444,6 +629,7 @@ void HardwareTestActivity::renderActionsPage(int& y) {
 
   const char* actions[actionCount] = {"Refresh readings",
                                       "Light sleep: timer only",
+                                      "Auto LS: buttons/30s",
                                       "Light sleep: timer no latch",
                                       "Light sleep: GPIO1 low",
                                       "Light sleep: GPIO2 low",
@@ -460,6 +646,15 @@ void HardwareTestActivity::renderActionsPage(int& y) {
   for (const auto& wrapped : renderer.wrappedText(UI_10_FONT_ID, lastSleepReport.c_str(),
                                                   renderer.getScreenWidth() - metrics.contentSidePadding * 2, 3)) {
     drawLine(renderer, y, wrapped.c_str());
+  }
+  if (!lastSleepStatsLine1.empty()) {
+    drawLine(renderer, y, lastSleepStatsLine1.c_str());
+  }
+  if (!lastSleepStatsLine2.empty()) {
+    drawLine(renderer, y, lastSleepStatsLine2.c_str());
+  }
+  if (!lastSleepStatsLine3.empty()) {
+    drawLine(renderer, y, lastSleepStatsLine3.c_str());
   }
 }
 

@@ -8,6 +8,8 @@ void Activity::onExit() { LOG_DBG("ACT", "Exiting activity: %s", name.c_str()); 
 
 void Activity::requestUpdate(bool immediate) { activityManager.requestUpdate(immediate); }
 
+void Activity::triggerRenderIfRequested() { activityManager.triggerRenderIfRequested(); }
+
 void Activity::requestUpdateAndWait() { activityManager.requestUpdateAndWait(); }
 
 void Activity::onGoHome(HomeMenuItem item) { activityManager.goHome(item); }

@@ -114,6 +114,9 @@ class ActivityManager {
   // Otherwise, it will be deferred until the end of the current loop iteration.
   void requestUpdate(bool immediate = false);
 
+  // Trigger a render immediately when a deferred update is pending.
+  void triggerRenderIfRequested();
+
   // Trigger a render and block until it completes.
   // Must NOT be called from the render task or while holding a RenderLock.
   void requestUpdateAndWait();

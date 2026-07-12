@@ -38,6 +38,9 @@ class Activity {
   // Otherwise, it will be deferred until the end of the current loop iteration.
   virtual void requestUpdate(bool immediate = false);
 
+  // Trigger a render if requested
+  virtual void triggerRenderIfRequested();
+
   // Request an immediate render and block until it completes.
   virtual void requestUpdateAndWait();
 

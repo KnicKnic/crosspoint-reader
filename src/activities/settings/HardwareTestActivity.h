@@ -15,16 +15,20 @@ class HardwareTestActivity final : public Activity {
   unsigned long lastRefreshMs = 0;
   std::string lastButtonEvent = "None";
   std::string lastSleepReport = "No sleep test yet";
+  std::string lastSleepStatsLine1;
+  std::string lastSleepStatsLine2;
+  std::string lastSleepStatsLine3;
   bool sleepPromptVisible = false;
   std::string sleepPrompt;
 
-  static constexpr int actionCount = 8;
+  static constexpr int actionCount = 9;
   static constexpr int pageCount = 3;
 
   void updateButtonEvent();
   void nextPage();
   void previousPage();
   void runTimerOnlyLightSleepTest();
+  void runAutoLightSleepBlockTest();
   void runTimerNoLatchLightSleepTest();
   void runGpio1LightSleepTest();
   void runGpio2LightSleepTest();

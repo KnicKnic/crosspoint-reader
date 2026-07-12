@@ -44,8 +44,12 @@ void ActivityManager::renderTaskLoop() {
     // where the main task deletes the activity between the null-check and render().
     RenderLock lock;
     if (currentActivity) {
-      HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
-      currentActivity->render(std::move(lock));
+      if(currentActivity->ownsPowerManagement()) {        
+        HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
+        currentActivity->render(std::move(lock));
+      } else {
+        currentActivity->render(std::move(lock));
+      }
     }
     // Notify any task blocked in requestUpdateAndWait() that the render is done.
     TaskHandle_t waiter = nullptr;
@@ -305,6 +309,16 @@ void ActivityManager::requestUpdate(bool immediate) {
     requestedUpdate = true;
   }
 }
+
+void ActivityManager::triggerRenderIfRequested() {
+  if (requestedUpdate) {
+    if (renderTaskHandle) {
+      xTaskNotify(renderTaskHandle, 1, eIncrement);
+    }
+    requestedUpdate = false;
+  }
+}
+
 void ActivityManager::requestUpdateAndWait() {
   if (!renderTaskHandle) {
     return;

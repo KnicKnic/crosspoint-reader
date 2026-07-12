@@ -77,6 +77,7 @@ class HalGPIO {
   void startDeepSleep();
 
   // Configure X3 button GPIOs as automatic light-sleep wake sources.
+  bool areX3LightSleepButtonWakePinsIdle() const;
   void enableX3LightSleepButtonWake(void (*interruptHandler)());
   void enableX3LightSleepPowerButtonWake(void (*interruptHandler)());
   void disableX3LightSleepButtonWake();

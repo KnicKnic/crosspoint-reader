@@ -241,6 +241,19 @@ void HalGPIO::startDeepSleep() {
 }
 
 
+bool HalGPIO::areX3LightSleepButtonWakePinsIdle() const {
+  if (!deviceIsX3()) {
+    return false;
+  }
+
+  pinMode(InputManager::BUTTON_ADC_PIN_1, INPUT_PULLUP);
+  pinMode(InputManager::BUTTON_ADC_PIN_2, INPUT_PULLUP);
+  pinMode(InputManager::POWER_BUTTON_PIN, INPUT_PULLUP);
+
+  return digitalRead(InputManager::BUTTON_ADC_PIN_1) == HIGH && digitalRead(InputManager::BUTTON_ADC_PIN_2) == HIGH &&
+         digitalRead(InputManager::POWER_BUTTON_PIN) == HIGH;
+}
+
 void HalGPIO::enableX3LightSleepButtonWake(void (*interruptHandler)()) {
   if (!deviceIsX3() || x3LightSleepButtonWakeEnabled) {
     return;
@@ -268,9 +281,9 @@ void HalGPIO::enableX3LightSleepButtonWake(void (*interruptHandler)()) {
   }
 
   if (interruptHandler) {
-    attachInterrupt(digitalPinToInterrupt(InputManager::BUTTON_ADC_PIN_1), interruptHandler, FALLING);
-    attachInterrupt(digitalPinToInterrupt(InputManager::BUTTON_ADC_PIN_2), interruptHandler, FALLING);
-    attachInterrupt(digitalPinToInterrupt(InputManager::POWER_BUTTON_PIN), interruptHandler, FALLING);
+    attachInterrupt(digitalPinToInterrupt(InputManager::BUTTON_ADC_PIN_1), interruptHandler, ONLOW_WE);
+    attachInterrupt(digitalPinToInterrupt(InputManager::BUTTON_ADC_PIN_2), interruptHandler, ONLOW_WE);
+    attachInterrupt(digitalPinToInterrupt(InputManager::POWER_BUTTON_PIN), interruptHandler, ONLOW_WE);
   }
 
   x3LightSleepButtonWakeEnabled = true;
@@ -299,7 +312,7 @@ void HalGPIO::enableX3LightSleepPowerButtonWake(void (*interruptHandler)()) {
   }
 
   if (interruptHandler) {
-    attachInterrupt(digitalPinToInterrupt(InputManager::POWER_BUTTON_PIN), interruptHandler, FALLING);
+    attachInterrupt(digitalPinToInterrupt(InputManager::POWER_BUTTON_PIN), interruptHandler, ONLOW_WE);
   }
 
   x3LightSleepButtonWakeEnabled = true;

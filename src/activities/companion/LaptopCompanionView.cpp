@@ -20,12 +20,14 @@ State lastRenderedState;
 uint32_t renderWriteCount = 0;
 
 bool statusPageMatches(const State& a, const State& b) {
-  return a.hostConnected == b.hostConnected && a.statusMessage == b.statusMessage &&
+  return a.hostConnected == b.hostConnected && a.inputControlsVisible == b.inputControlsVisible &&
+         a.statusMessage == b.statusMessage &&
          a.microphoneMessage == b.microphoneMessage && a.cameraMessage == b.cameraMessage;
 }
 
 bool diagnosticsPageMatches(const State& a, const State& b) {
-  return a.powerStatsMessage == b.powerStatsMessage && a.powerDeltaMessage == b.powerDeltaMessage &&
+  return a.inputControlsVisible == b.inputControlsVisible && a.powerStatsMessage == b.powerStatsMessage &&
+         a.powerDeltaMessage == b.powerDeltaMessage &&
          a.powerAccountingMessage == b.powerAccountingMessage && a.wakeCauseMessage == b.wakeCauseMessage &&
          a.powerTimerMessage == b.powerTimerMessage && a.bleAdvertiseMessage == b.bleAdvertiseMessage &&
          a.bleConnectionMessage == b.bleConnectionMessage && a.bleActivityMessage == b.bleActivityMessage &&
@@ -79,7 +81,9 @@ void drawStatusPage(GfxRenderer& renderer, MappedInputManager& mappedInput, cons
 
   drawRenderWriteCount(renderer, contentX, renderWriteCount);
 
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_TOGGLE), "", "Stats");
+  const auto labels =
+      mappedInput.mapLabels(state.inputControlsVisible ? tr(STR_BACK) : "",
+                            state.inputControlsVisible ? tr(STR_TOGGLE) : "", "", "Stats");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 }
 
@@ -110,7 +114,9 @@ void drawDiagnosticsPage(GfxRenderer& renderer, MappedInputManager& mappedInput,
 
   drawRenderWriteCount(renderer, contentX, renderWriteCount);
 
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_TOGGLE), "", "Main");
+  const auto labels =
+      mappedInput.mapLabels(state.inputControlsVisible ? tr(STR_BACK) : "",
+                            state.inputControlsVisible ? tr(STR_TOGGLE) : "", "", "Main");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 }
 }  // namespace

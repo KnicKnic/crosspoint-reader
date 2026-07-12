@@ -11,6 +11,7 @@ enum class Page : uint8_t { Status, Diagnostics };
 
 struct State {
   bool hostConnected = false;
+  bool inputControlsVisible = true;
   std::string statusMessage = "Waiting for host";
   std::string microphoneMessage = "Unknown";
   std::string cameraMessage = "Unknown";

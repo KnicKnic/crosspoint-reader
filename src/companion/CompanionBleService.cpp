@@ -92,6 +92,20 @@ uint32_t deltaCounter(uint32_t current, uint32_t previous) {
   return current >= previous ? current - previous : 0;
 }
 
+unsigned long minDelayMs(unsigned long current, unsigned long candidate) {
+  return candidate < current ? candidate : current;
+}
+
+unsigned long delayUntilMs(unsigned long now, unsigned long target) {
+  return static_cast<long>(now - target) >= 0 ? 0 : target - now;
+}
+
+void clearCallbackTarget(CompanionBleService* service) {
+  if (g_service == service) {
+    g_service = nullptr;
+  }
+}
+
 class CompanionServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     (void)pServer;
@@ -266,6 +280,7 @@ bool CompanionBleService::begin() {
       if (ownsBluetoothStack) {
         btMgr.disable();
       }
+      clearCallbackTarget(this);
       ownsBluetoothStack = false;
       return false;
     }
@@ -278,6 +293,7 @@ bool CompanionBleService::begin() {
       if (ownsBluetoothStack) {
         btMgr.disable();
       }
+      clearCallbackTarget(this);
       ownsBluetoothStack = false;
       server = nullptr;
       return false;
@@ -306,6 +322,7 @@ bool CompanionBleService::begin() {
       if (ownsBluetoothStack) {
         btMgr.disable();
       }
+      clearCallbackTarget(this);
       ownsBluetoothStack = false;
       server = nullptr;
       return false;
@@ -322,6 +339,7 @@ bool CompanionBleService::begin() {
       if (ownsBluetoothStack) {
         btMgr.disable();
       }
+      clearCallbackTarget(this);
       ownsBluetoothStack = false;
       server = nullptr;
       hostTeamsStateCharacteristic = nullptr;
@@ -349,6 +367,7 @@ bool CompanionBleService::begin() {
   if (!advertising->start()) {
     LOG_ERR("COMP", "Failed to start companion advertising");
     BluetoothDiagnostics::record("companion_advertising_start_failed");
+    clearCallbackTarget(this);
     if (ownsBluetoothStack) {
       HalBluetoothManager::getInstance().disable();
       server = nullptr;
@@ -381,6 +400,9 @@ bool CompanionBleService::begin() {
 }
 
 void CompanionBleService::end() {
+  clearCallbackTarget(this);
+  statusChangedCallback = nullptr;
+
   if (!running) {
     resetSessionState();
     publishHostStateValues();
@@ -441,6 +463,11 @@ bool CompanionBleService::hasConnectedHosts() const {
   return !server->getPeerDevices().empty();
 }
 
+bool CompanionBleService::isAdvertising() const {
+  auto* advertising = NimBLEDevice::getAdvertising();
+  return running && !hostConnected && advertising && advertising->isAdvertising();
+}
+
 void CompanionBleService::resetSessionState() {
   hostConnected = false;
   hostConnHandle = 0xFFFF;
@@ -479,6 +506,27 @@ bool CompanionBleService::isConnectionHandshakeActive() const {
   return hostConnected && (!buttonEventSubscribed || !hostStateReceived);
 }
 
+unsigned long CompanionBleService::getNextUpdateDelayMs(unsigned long now) const {
+  if (!running || !server) {
+    return COMPANION_MAINTENANCE_INTERVAL_MS;
+  }
+
+  unsigned long delayMs = delayUntilMs(now, lastMaintenanceAtMs + COMPANION_MAINTENANCE_INTERVAL_MS);
+  if (advertisingRestartPending) {
+    delayMs = minDelayMs(delayMs, delayUntilMs(now, pendingAdvertisingRestartAtMs));
+  }
+  if (hostConnected && responsiveUntilMs != 0) {
+    delayMs = minDelayMs(delayMs, delayUntilMs(now, responsiveUntilMs));
+  }
+  if (isConnectionHandshakeActive() && hostConnectedAtMs != 0) {
+    delayMs = minDelayMs(delayMs, delayUntilMs(now, hostConnectedAtMs + COMPANION_HANDSHAKE_TIMEOUT_MS));
+  }
+  if (lastStateLogAtMs != 0) {
+    delayMs = minDelayMs(delayMs, delayUntilMs(now, lastStateLogAtMs + COMPANION_STATE_LOG_INTERVAL_MS));
+  }
+  return delayMs;
+}
+
 void CompanionBleService::update() {
   if (!running || !server) {
     return;
@@ -488,11 +536,18 @@ void CompanionBleService::update() {
   const unsigned long now = millis();
   const bool pendingRestartDue =
       advertisingRestartPending && static_cast<long>(now - pendingAdvertisingRestartAtMs) >= 0;
-  if (!pendingRestartDue && now - lastMaintenanceAtMs < COMPANION_MAINTENANCE_INTERVAL_MS) {
+  const bool responsiveDue = hostConnected && responsiveUntilMs != 0 && static_cast<long>(now - responsiveUntilMs) >= 0;
+  const bool stateLogDue = lastStateLogAtMs == 0 || now - lastStateLogAtMs >= COMPANION_STATE_LOG_INTERVAL_MS;
+  const bool handshakeDue = isConnectionHandshakeActive() && hostConnectedAtMs != 0 &&
+                            now - hostConnectedAtMs > COMPANION_HANDSHAKE_TIMEOUT_MS;
+  const bool maintenanceDue = now - lastMaintenanceAtMs >= COMPANION_MAINTENANCE_INTERVAL_MS;
+  if (!pendingRestartDue && !responsiveDue && !stateLogDue && !handshakeDue && !maintenanceDue) {
     return;
   }
-  lastMaintenanceAtMs = now;
   activityStats.maintenanceRuns++;
+  if (maintenanceDue || pendingRestartDue) {
+    lastMaintenanceAtMs = now;
+  }
 
   const bool hasPeers = hasConnectedHosts();
   if (advertisingRestartPending && static_cast<long>(now - pendingAdvertisingRestartAtMs) >= 0) {
@@ -515,12 +570,12 @@ void CompanionBleService::update() {
     return;
   }
 
-  if (hostConnected && responsiveUntilMs != 0 && static_cast<long>(now - responsiveUntilMs) >= 0) {
+  if (responsiveDue) {
     responsiveUntilMs = 0;
     requestIdleConnectionParamsIfReady("responsive_window_elapsed");
   }
 
-  if (lastStateLogAtMs == 0 || now - lastStateLogAtMs >= COMPANION_STATE_LOG_INTERVAL_MS) {
+  if (stateLogDue) {
     logStateSnapshot("periodic");
   }
 
@@ -532,8 +587,7 @@ void CompanionBleService::update() {
     return;
   }
 
-  if (isConnectionHandshakeActive() && hostConnectedAtMs != 0 &&
-      now - hostConnectedAtMs > COMPANION_HANDSHAKE_TIMEOUT_MS) {
+  if (handshakeDue) {
     LOG_INF("COMP", "Disconnecting stale companion host handshake; buttonSub=%d stateReceived=%d ageMs=%lu",
             buttonEventSubscribed, hostStateReceived, now - hostConnectedAtMs);
     BluetoothDiagnostics::recordf("companion_stale_handshake_disconnect", "buttonSub=%d state=%d ageMs=%lu",

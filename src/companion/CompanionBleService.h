@@ -44,7 +44,9 @@ class CompanionBleService {
   void end();
   bool isRunning() const { return running; }
   bool isHostConnected() const { return hostConnected; }
+  bool isAdvertising() const;
   bool isConnectionHandshakeActive() const;
+  unsigned long getNextUpdateDelayMs(unsigned long now) const;
   void update();
   bool restartAdvertising(const char* reason);
   std::string getStatusText() const;

@@ -8,6 +8,7 @@
 #include <Logging.h>
 #include <PmLockTrace.h>
 
+#include <algorithm>
 #include <cstdio>
 
 #include "MappedInputManager.h"
@@ -18,14 +19,47 @@ namespace {
 constexpr unsigned long NO_HOST_WAKE_GRACE_MS = 10UL * 60UL * 1000UL;
 constexpr unsigned long POWER_DIAGNOSTIC_INTERVAL_MS = 20UL * 1000UL;
 constexpr unsigned long LOOP_DELAY_MS = 100UL;
-constexpr bool COMPANION_POWER_BUTTON_LIGHT_SLEEP_WAKE_ENABLED = false;
+constexpr unsigned long COMPANION_IDLE_WAIT_MS = 20UL * 1000UL;
+constexpr unsigned long BUTTON_POLLING_WINDOW_MS = 10UL * 1000UL;
+constexpr unsigned long BUTTON_WAKE_ARM_COOLDOWN_MS = 10UL * 1000UL;
 constexpr bool COMPANION_DISABLE_BLE_EXPERIMENT = false;
+constexpr bool COMPANION_ENABLE_AUTO_LIGHT_SLEEP = true;
 constexpr bool COMPANION_SERIAL_DIAGNOSTICS_ENABLED = false;
+constexpr bool COMPANION_QUIET_SERIAL_FOR_SLEEP_MEASUREMENT =
+    COMPANION_ENABLE_AUTO_LIGHT_SLEEP && !COMPANION_SERIAL_DIAGNOSTICS_ENABLED;
+
+SemaphoreHandle_t companionLoopWakeSemaphore = nullptr;
+volatile bool companionButtonWakeOneShotArmed = false;
+volatile bool companionButtonWakeOneShotFired = false;
 
 struct NamedDelta {
   const char* name = "";
   uint64_t count = 0;
 };
+
+void IRAM_ATTR companionButtonWakeInterrupt() {
+  if (!companionButtonWakeOneShotArmed) {
+    return;
+  }
+
+  companionButtonWakeOneShotArmed = false;
+  disableInterrupt(InputManager::BUTTON_ADC_PIN_1);
+  disableInterrupt(InputManager::BUTTON_ADC_PIN_2);
+  disableInterrupt(InputManager::POWER_BUTTON_PIN);
+  companionButtonWakeOneShotFired = true;
+
+  SemaphoreHandle_t semaphore = companionLoopWakeSemaphore;
+  companionLoopWakeSemaphore = nullptr;
+  if (!semaphore) {
+    return;
+  }
+
+  BaseType_t higherPriorityTaskWoken = pdFALSE;
+  xSemaphoreGiveFromISR(semaphore, &higherPriorityTaskWoken);
+  if (higherPriorityTaskWoken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
+}
 
 void formatDurationUs(uint64_t durationUs, char* buffer, size_t bufferSize) {
   const uint64_t totalMs = durationUs / 1000ULL;
@@ -276,20 +310,39 @@ void configureSerialDiagnosticsOutput() {
 #endif
 #endif
 }
+
+void logButtonWakePinLevels(const char* reason) {
+  LOG_INF("COMP", "Button wake pins reason=%s g1=%d adc1=%d g2=%d adc2=%d g3=%d", reason ? reason : "",
+          digitalRead(InputManager::BUTTON_ADC_PIN_1), analogRead(InputManager::BUTTON_ADC_PIN_1),
+          digitalRead(InputManager::BUTTON_ADC_PIN_2), analogRead(InputManager::BUTTON_ADC_PIN_2),
+          digitalRead(InputManager::POWER_BUTTON_PIN));
+}
 }  // namespace
 
 LaptopCompanionActivity::LaptopCompanionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
-    : Activity("LaptopCompanion", renderer, mappedInput), viewStateMutex(xSemaphoreCreateMutex()) {
+    : Activity("LaptopCompanion", renderer, mappedInput),
+      viewStateMutex(xSemaphoreCreateMutex()),
+      loopWakeSemaphore(xSemaphoreCreateBinary()) {
   if (!viewStateMutex) {
     LOG_ERR("COMP", "View state mutex create failed");
+  }
+  if (!loopWakeSemaphore) {
+    LOG_ERR("COMP", "Loop wake semaphore create failed");
   }
 }
 
 LaptopCompanionActivity::~LaptopCompanionActivity() {
   restoreSerialLogOutput();
+  companionButtonWakeOneShotArmed = false;
+  companionButtonWakeOneShotFired = false;
+  disableButtonLightSleepWake("destructor");
   if (viewStateMutex) {
     vSemaphoreDelete(viewStateMutex);
     viewStateMutex = nullptr;
+  }
+  if (loopWakeSemaphore) {
+    vSemaphoreDelete(loopWakeSemaphore);
+    loopWakeSemaphore = nullptr;
   }
 }
 
@@ -302,6 +355,12 @@ void LaptopCompanionActivity::lockViewState() const {
 void LaptopCompanionActivity::unlockViewState() const {
   if (viewStateMutex) {
     xSemaphoreGive(viewStateMutex);
+  }
+}
+
+void LaptopCompanionActivity::wakeLoopFromCallback() {
+  if (loopWakeSemaphore) {
+    xSemaphoreGive(loopWakeSemaphore);
   }
 }
 
@@ -332,18 +391,187 @@ void LaptopCompanionActivity::restoreSerialLogOutput() {
   serialLogOutputQuieted = false;
 }
 
+bool LaptopCompanionActivity::setInputControlsVisible(bool visible) {
+  bool changed = false;
+  lockViewState();
+  if (viewState.inputControlsVisible != visible) {
+    viewState.inputControlsVisible = visible;
+    changed = true;
+  }
+  unlockViewState();
+  if (changed) {
+    requestUpdate();
+  }
+  return changed;
+}
+
+bool LaptopCompanionActivity::isButtonPollingWindowActive(unsigned long now) const {
+  return buttonPollingUntilMs != 0 && static_cast<long>(now - buttonPollingUntilMs) < 0;
+}
+
+void LaptopCompanionActivity::enterButtonPollingWindow(const char* reason) {
+  buttonPollingUntilMs = millis() + BUTTON_POLLING_WINDOW_MS;
+  setInputControlsVisible(true);
+  disableButtonLightSleepWake(reason);
+}
+
+void LaptopCompanionActivity::consumeButtonLightSleepWakeOneShot(const char* reason) {
+  companionButtonWakeOneShotFired = false;
+  enterButtonPollingWindow(reason);
+}
+
+void LaptopCompanionActivity::disableButtonLightSleepWake(const char* reason) {
+  companionButtonWakeOneShotArmed = false;
+  if (companionLoopWakeSemaphore == loopWakeSemaphore) {
+    companionLoopWakeSemaphore = nullptr;
+  }
+  if (!buttonLightSleepWakeEnabled) {
+    return;
+  }
+
+  gpio.disableX3LightSleepButtonWake();
+  buttonLightSleepWakeEnabled = false;
+  LOG_INF("COMP", "Button light-sleep GPIO wake disabled reason=%s", reason ? reason : "");
+}
+
+bool LaptopCompanionActivity::updateButtonLightSleepWakeMode() {
+  auto& service = CompanionBleService::getInstance();
+  const unsigned long now = millis();
+  if (buttonPollingUntilMs != 0 && !isButtonPollingWindowActive(now)) {
+    buttonPollingUntilMs = 0;
+  }
+  const bool pollingWindowActive = isButtonPollingWindowActive(now);
+  const bool buttonWakeIdleMode = !COMPANION_DISABLE_BLE_EXPERIMENT && gpio.deviceIsX3() && service.isRunning() &&
+                                  (service.isHostConnected() || service.isAdvertising());
+  const bool visibilityChanged = setInputControlsVisible(!buttonWakeIdleMode || pollingWindowActive);
+
+  const bool shouldEnable = !COMPANION_DISABLE_BLE_EXPERIMENT && !COMPANION_SERIAL_DIAGNOSTICS_ENABLED &&
+                            gpio.deviceIsX3() && !pollingWindowActive && buttonWakeIdleMode;
+  if (!shouldEnable) {
+    disableButtonLightSleepWake("not_idle");
+    return visibilityChanged;
+  }
+
+  if (buttonLightSleepWakeEnabled) {
+    return visibilityChanged;
+  }
+
+  if (visibilityChanged) {
+    return true;
+  }
+
+  if (lastButtonLightSleepArmAtMs != 0 &&
+      static_cast<unsigned long>(now - lastButtonLightSleepArmAtMs) < BUTTON_WAKE_ARM_COOLDOWN_MS) {
+    return false;
+  }
+
+  logButtonWakePinLevels("pre_arm");
+  if (!gpio.areX3LightSleepButtonWakePinsIdle()) {
+    buttonPollingUntilMs = millis() + BUTTON_POLLING_WINDOW_MS;
+    setInputControlsVisible(true);
+    logButtonWakePinLevels("arm_skipped_low");
+    LOG_INF("COMP", "Button light-sleep GPIO wake one-shot skipped; pin already low");
+    return true;
+  }
+
+  companionButtonWakeOneShotFired = false;
+  companionLoopWakeSemaphore = loopWakeSemaphore;
+  companionButtonWakeOneShotArmed = true;
+  lastButtonLightSleepArmAtMs = now;
+  gpio.enableX3LightSleepButtonWake(companionButtonWakeInterrupt);
+  buttonLightSleepWakeEnabled = true;
+  if (companionButtonWakeOneShotFired) {
+    LOG_INF("COMP", "Button light-sleep GPIO wake one-shot fired while arming");
+    logButtonWakePinLevels("fired_while_arming");
+    consumeButtonLightSleepWakeOneShot("button_wake_arm");
+    return true;
+  }
+  LOG_INF("COMP", "Button light-sleep GPIO wake one-shot enabled");
+  return false;
+}
+
+unsigned long LaptopCompanionActivity::getNextLoopWaitMs(unsigned long now) const {
+  if (COMPANION_SERIAL_DIAGNOSTICS_ENABLED) {
+    return LOOP_DELAY_MS;
+  }
+  if (isButtonPollingWindowActive(now)) {
+    return LOOP_DELAY_MS;
+  }
+
+  unsigned long waitMs = COMPANION_IDLE_WAIT_MS;
+  if (!COMPANION_DISABLE_BLE_EXPERIMENT) {
+    waitMs = std::min(waitMs, CompanionBleService::getInstance().getNextUpdateDelayMs(now));
+  }
+  if (lastPowerDiagnosticAtMs != 0) {
+    const unsigned long nextDiagnosticMs = lastPowerDiagnosticAtMs + POWER_DIAGNOSTIC_INTERVAL_MS;
+    waitMs = std::min(waitMs, static_cast<unsigned long>(static_cast<long>(now - nextDiagnosticMs) >= 0
+                                                             ? 0
+                                                             : nextDiagnosticMs - now));
+  }
+  return waitMs;
+}
+
+void LaptopCompanionActivity::waitForNextLoopEvent(unsigned long waitMs) {
+  if (!loopWakeSemaphore || waitMs == 0) {
+    return;
+  }
+
+  xSemaphoreTake(loopWakeSemaphore, pdMS_TO_TICKS(waitMs));
+}
+
+void LaptopCompanionActivity::runButtonLightSleepIdleLoop() {
+  auto& service = CompanionBleService::getInstance();
+  while (buttonLightSleepWakeEnabled) {
+    waitForNextLoopEvent(getNextLoopWaitMs(millis()));
+    if (companionButtonWakeOneShotFired) {
+      LOG_INF("COMP", "Button light-sleep GPIO wake one-shot consumed");
+      logButtonWakePinLevels("wake_isr_consumed");
+      consumeButtonLightSleepWakeOneShot("button_wake_isr");
+      return;
+    }
+
+    bool requestedRender = false;
+    if (!COMPANION_DISABLE_BLE_EXPERIMENT) {
+      service.update();
+    }
+    if (updatePowerDiagnostics(false)) {
+      requestUpdate();
+    }
+    updateNoHostTimer(!COMPANION_DISABLE_BLE_EXPERIMENT && service.isHostConnected());
+    if (!COMPANION_DISABLE_BLE_EXPERIMENT && service.consumeStatusChanged()) {
+      const auto hostStatus = service.getHostStatus();
+      lockViewState();
+      viewState.hostConnected = service.isHostConnected();
+      viewState.statusMessage = service.getStatusText();
+      viewState.microphoneMessage = LaptopCompanionView::triStateText(hostStatus.microphone, "Muted", "Live");
+      viewState.cameraMessage = LaptopCompanionView::triStateText(hostStatus.camera, "Off", "Active");
+      unlockViewState();
+      requestUpdate();
+    }
+
+    if (updateButtonLightSleepWakeMode()) {
+      requestUpdate();
+    }
+
+    if (companionButtonWakeOneShotFired) {
+      LOG_INF("COMP", "Button light-sleep GPIO wake one-shot consumed");
+      logButtonWakePinLevels("wake_isr_consumed");
+      consumeButtonLightSleepWakeOneShot("button_wake_isr");
+      return;
+    }
+
+    triggerRenderIfRequested();
+  }
+}
+
 void LaptopCompanionActivity::onEnter() {
   Activity::onEnter();
-  if (COMPANION_SERIAL_DIAGNOSTICS_ENABLED) {
-    configureSerialDiagnosticsOutput();
-  } else {
-    quietSerialLogOutput();
-  }
   noHostConnectedSinceMs = 0;
   lastPowerDiagnosticAtMs = 0;
   lockViewState();
   viewState.hostConnected = false;
-  viewState.statusMessage = "Waiting for host";
+  viewState.inputControlsVisible = true;
+  viewState.statusMessage = "Starting companion";
   viewState.microphoneMessage = "Unknown";
   viewState.cameraMessage = "Unknown";
   viewState.powerStatsMessage = powerManager.formatLightSleepStats();
@@ -365,15 +593,17 @@ void LaptopCompanionActivity::onEnter() {
   LaptopCompanionView::resetRenderCache();
   hasLastPowerDiagnosticStats = false;
   hasLastPowerDiagnosticPmLockStats = false;
+  buttonLightSleepWakeEnabled = false;
+  companionButtonWakeOneShotArmed = false;
+  companionButtonWakeOneShotFired = false;
+  buttonPollingUntilMs = 0;
+  lastButtonLightSleepArmAtMs = 0;
   lastRenderDurationMs = 0;
+  requestUpdate();
 
-  if (COMPANION_POWER_BUTTON_LIGHT_SLEEP_WAKE_ENABLED) {
-    gpio.enableX3LightSleepPowerButtonWake(nullptr);
-  }
   if (COMPANION_SERIAL_DIAGNOSTICS_ENABLED) {
+    configureSerialDiagnosticsOutput();
     powerManager.configureAutoLightSleep(false);
-  } else if (!powerManager.configureAutoLightSleep(true)) {
-    LOG_ERR("COMP", "Auto light sleep enable failed");
   }
 
   if (COMPANION_DISABLE_BLE_EXPERIMENT) {
@@ -383,7 +613,11 @@ void LaptopCompanionActivity::onEnter() {
     LOG_INF("COMP", "BLE/NimBLE startup skipped for sleep experiment");
   } else {
     auto& service = CompanionBleService::getInstance();
-    service.setStatusChangedCallback([this] { requestUpdate(); });
+    service.setStatusChangedCallback([this] { wakeLoopFromCallback(); });
+    lockViewState();
+    viewState.statusMessage = "Starting BLE";
+    unlockViewState();
+    requestUpdate();
     if (!service.begin()) {
       lockViewState();
       viewState.statusMessage = "BLE start failed";
@@ -397,15 +631,50 @@ void LaptopCompanionActivity::onEnter() {
   updateNoHostTimer(false);
   updatePowerDiagnostics(true);
   requestUpdate();
+
+  if (COMPANION_ENABLE_AUTO_LIGHT_SLEEP && !COMPANION_SERIAL_DIAGNOSTICS_ENABLED) {
+    lockViewState();
+    viewState.statusMessage = "Enabling auto sleep";
+    unlockViewState();
+  requestUpdate();
+    LOG_INF("COMP", "Enabling auto light sleep after BLE startup");
+    const bool autoLightSleepEnabled = powerManager.configureAutoLightSleep(true);
+    if (!autoLightSleepEnabled) {
+      LOG_ERR("COMP", "Auto light sleep enable failed");
+      lockViewState();
+      viewState.statusMessage = "Auto sleep failed";
+      unlockViewState();
+  requestUpdate();
+    } else {
+      lockViewState();
+      viewState.statusMessage = CompanionBleService::getInstance().getStatusText();
+      viewState.inputControlsVisible = false;
+      unlockViewState();
+  requestUpdate();
+      LOG_INF("COMP", "Companion button wake will arm from loop");
+    }
+  } else if (!COMPANION_SERIAL_DIAGNOSTICS_ENABLED) {
+    lockViewState();
+    viewState.statusMessage = CompanionBleService::getInstance().getStatusText();
+    viewState.inputControlsVisible = false;
+    unlockViewState();
+  requestUpdate();
+    LOG_INF("COMP", "Auto light sleep skipped for GPIO wake diagnostics");
+    LOG_INF("COMP", "Companion button wake will arm from loop");
+  }
+  if (COMPANION_QUIET_SERIAL_FOR_SLEEP_MEASUREMENT) {
+    quietSerialLogOutput();
+  }
+  triggerRenderIfRequested();
 }
 
 void LaptopCompanionActivity::onExit() {
+  companionButtonWakeOneShotArmed = false;
+  companionButtonWakeOneShotFired = false;
+  disableButtonLightSleepWake("exit");
   if (!COMPANION_DISABLE_BLE_EXPERIMENT) {
     CompanionBleService::getInstance().setStatusChangedCallback(nullptr);
     CompanionBleService::getInstance().end();
-  }
-  if (COMPANION_POWER_BUTTON_LIGHT_SLEEP_WAKE_ENABLED) {
-    gpio.disableX3LightSleepButtonWake();
   }
   powerManager.configureAutoLightSleep(false);
   restoreSerialLogOutput();
@@ -414,10 +683,24 @@ void LaptopCompanionActivity::onExit() {
 
 void LaptopCompanionActivity::loop() {
   auto& service = CompanionBleService::getInstance();
+  bool requestedRender = false;
+  if (companionButtonWakeOneShotFired) {
+    LOG_INF("COMP", "Button light-sleep GPIO wake one-shot consumed");
+    logButtonWakePinLevels("wake_isr_consumed");
+    consumeButtonLightSleepWakeOneShot("button_wake_isr");
+  }
   if (!COMPANION_DISABLE_BLE_EXPERIMENT) {
     service.update();
   }
-  updatePowerDiagnostics(false);
+
+  const bool pollingWindowActive = isButtonPollingWindowActive(millis());
+  if (pollingWindowActive && (gpio.wasAnyPressed() || gpio.wasAnyReleased())) {
+    enterButtonPollingWindow("button");
+  }
+
+  if (updatePowerDiagnostics(false)) {
+    requestedRender = true;
+  }
   updateNoHostTimer(!COMPANION_DISABLE_BLE_EXPERIMENT && service.isHostConnected());
   if (!COMPANION_DISABLE_BLE_EXPERIMENT && service.consumeStatusChanged()) {
     const auto hostStatus = service.getHostStatus();
@@ -428,9 +711,14 @@ void LaptopCompanionActivity::loop() {
     viewState.cameraMessage = LaptopCompanionView::triStateText(hostStatus.camera, "Off", "Active");
     unlockViewState();
     requestUpdate();
+    requestedRender = true;
   }
 
-  if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+  const bool inputControlsVisible = isButtonPollingWindowActive(millis()) || COMPANION_DISABLE_BLE_EXPERIMENT ||
+                                    !gpio.deviceIsX3() || !service.isRunning() ||
+                                    !(service.isHostConnected() || service.isAdvertising());
+
+  if (inputControlsVisible && mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     activityManager.goHome();
     return;
   }
@@ -441,18 +729,33 @@ void LaptopCompanionActivity::loop() {
                                                                  : LaptopCompanionView::Page::Status;
     unlockViewState();
     requestUpdate();
+    requestedRender = true;
   }
 
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+  if (inputControlsVisible && mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     const bool sent = !COMPANION_DISABLE_BLE_EXPERIMENT && service.notifyToggleMuteReleased();
     lockViewState();
     viewState.statusMessage =
         COMPANION_DISABLE_BLE_EXPERIMENT ? "BLE disabled experiment" : (sent ? "Mute button sent" : "Host not connected");
     unlockViewState();
     requestUpdate();
+    requestedRender = true;
   }
 
-  delay(LOOP_DELAY_MS);
+  if (requestedRender) {
+    return;
+  }
+
+  if (updateButtonLightSleepWakeMode()) {
+    return;
+  }
+
+  if (!buttonLightSleepWakeEnabled) {
+    waitForNextLoopEvent(std::min(getNextLoopWaitMs(millis()), LOOP_DELAY_MS));
+    return;
+  }
+
+  runButtonLightSleepIdleLoop();
 }
 
 bool LaptopCompanionActivity::suppressAutoDeepSleep() {
@@ -494,10 +797,10 @@ void LaptopCompanionActivity::updateNoHostTimer(bool connected) {
   }
 }
 
-void LaptopCompanionActivity::updatePowerDiagnostics(bool forceLog) {
+bool LaptopCompanionActivity::updatePowerDiagnostics(bool forceLog) {
   const unsigned long now = millis();
   if (!forceLog && lastPowerDiagnosticAtMs != 0 && now - lastPowerDiagnosticAtMs < POWER_DIAGNOSTIC_INTERVAL_MS) {
-    return;
+    return false;
   }
   const auto stats = powerManager.getLightSleepStats();
   const auto pmLockStats = powerManager.getPmLockTimingStats();
@@ -562,6 +865,7 @@ void LaptopCompanionActivity::updatePowerDiagnostics(bool forceLog) {
   LOG_INF("COMP", "%s", pmLockLine5.c_str());
   powerManager.logLightSleepDiagnostics("laptop_companion");
   requestUpdate();
+  return true;
 }
 
 bool LaptopCompanionActivity::shouldHoldWakeForCompanion() const {
