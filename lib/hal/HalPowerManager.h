@@ -6,6 +6,11 @@
 #include <Logging.h>
 #include <Wire.h>
 #include <freertos/semphr.h>
+#include <sdkconfig.h>
+
+#if CONFIG_PM_ENABLE
+#include <esp_pm.h>
+#endif
 
 #include <cassert>
 
@@ -26,8 +31,17 @@ class HalPowerManager {
   enum LockMode { None, NormalSpeed };
   LockMode currentLockMode = None;
   SemaphoreHandle_t modeMutex = nullptr;  // Protect access to currentLockMode
+#if CONFIG_PM_ENABLE
+  esp_pm_lock_handle_t cpuMaxLock = nullptr;
+  bool cpuMaxLockAcquired = false;
+  bool pmConfigured = false;
+  bool autoLightSleepEnabled = false;
+  bool serialSuspendedForLightSleep = false;
+  esp_err_t configurePm(bool lightSleepEnable);
+#endif
 
  public:
+  static constexpr int DESIRED_MAX_FREQ = 160;                 // MHz
   static constexpr int LOW_POWER_FREQ = 10;                    // MHz
   static constexpr unsigned long IDLE_POWER_SAVING_MS = 3000;  // ms
   static constexpr unsigned long BATTERY_POLL_MS = 1500;       // ms
@@ -37,9 +51,15 @@ class HalPowerManager {
   // Control CPU frequency for power saving
   void setPowerSaving(bool enabled);
 
+  void setAutoLightSleep(bool enabled);
+  bool isAutoLightSleepEnabled() const;
+  bool isPowerManagementConfigured() const;
+  int getConfiguredMaxFrequencyMhz() const;
+  int getConfiguredMinFrequencyMhz() const;
+
   // Setup wake up GPIO and enter deep sleep
   // Should be called inside main loop() to handle the currentLockMode
-  void startDeepSleep(HalGPIO& gpio) const;
+  void startDeepSleep(HalGPIO& gpio);
 
   // Get battery percentage (range 0-100)
   uint16_t getBatteryPercentage() const;

@@ -32,6 +32,7 @@
 #include "fontIds.h"
 #include "images/LoadingIcon.h"
 #include "util/ButtonNavigator.h"
+#include "util/PowerProfiler.h"
 #include "util/ScreenshotUtil.h"
 
 GfxRenderer renderer(display);
@@ -345,6 +346,7 @@ void setup() {
   HalSystem::checkPanic();
 
   SETTINGS.loadFromFile();
+  powerManager.setAutoLightSleep(SETTINGS.autoLightSleep != 0);
   APP_STATE.loadFromFile();
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
@@ -484,6 +486,7 @@ void loop() {
   static unsigned long maxLoopDuration = 0;
   const unsigned long loopStartTime = millis();
   static unsigned long lastMemPrint = 0;
+  static unsigned long lastPowerStatsPrint = 0;
 
   gpio.update();
   halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, activityManager.isReaderActivity());
@@ -496,9 +499,14 @@ void loop() {
     lastMemPrint = millis();
   }
 
+  if (Serial && millis() - lastPowerStatsPrint >= 60000) {
+    PowerProfiler::printSerial();
+    lastPowerStatsPrint = millis();
+  }
+
   // Handle incoming serial commands,
   // nb: we use logSerial from logging to avoid deprecation warnings
-  if (logSerial.available() > 0) {
+  if (logSerial && logSerial.available() > 0) {
     String line = logSerial.readStringUntil('\n');
     if (line.startsWith("CMD:")) {
       String cmd = line.substring(4);

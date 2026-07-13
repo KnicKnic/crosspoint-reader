@@ -2,11 +2,17 @@
 
 #include <Logging.h>
 #include <WiFi.h>
+#include <esp_err.h>
 #include <esp_sleep.h>
 
+#include <algorithm>
 #include <cassert>
 
 #include "HalGPIO.h"
+
+namespace {
+constexpr gpio_num_t BATTERY_LATCH_PIN = GPIO_NUM_13;
+}
 
 HalPowerManager powerManager;  // Singleton instance
 
@@ -23,6 +29,125 @@ void HalPowerManager::begin() {
   normalFreq = getCpuFrequencyMhz();
   modeMutex = xSemaphoreCreateMutex();
   assert(modeMutex != nullptr);
+
+#if CONFIG_PM_ENABLE
+  esp_err_t err = configurePm(false);
+  if (err == ESP_OK) {
+    err = esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "crosspoint-active", &cpuMaxLock);
+    if (err == ESP_OK) {
+      pmConfigured = true;
+      LOG_INF("PWR", "ESP-IDF power management enabled: max=%d MHz min=%d MHz autosleep=off",
+              getConfiguredMaxFrequencyMhz(), getConfiguredMinFrequencyMhz());
+    } else {
+      LOG_ERR("PWR", "Failed to create CPU PM lock: %s", esp_err_to_name(err));
+    }
+  } else {
+    LOG_ERR("PWR", "Failed to configure ESP-IDF power management: %s", esp_err_to_name(err));
+  }
+#endif
+}
+
+#if CONFIG_PM_ENABLE
+esp_err_t HalPowerManager::configurePm(bool lightSleepEnable) {
+  esp_pm_config_t pmConfig = {};
+  pmConfig.max_freq_mhz = DESIRED_MAX_FREQ;
+  pmConfig.min_freq_mhz = LOW_POWER_FREQ;
+  pmConfig.light_sleep_enable = lightSleepEnable;
+
+  return esp_pm_configure(&pmConfig);
+}
+#endif
+
+void HalPowerManager::setAutoLightSleep(bool enabled) {
+#if CONFIG_PM_ENABLE
+  if (!pmConfigured) {
+    autoLightSleepEnabled = false;
+    return;
+  }
+  if (enabled == autoLightSleepEnabled) {
+    return;
+  }
+
+#ifdef ENABLE_SERIAL_LOG
+  if (enabled) {
+    if (logSerial) {
+      LOG_INF("PWR", "Disabling serial before enabling automatic light sleep");
+      logSerial.flush();
+      delay(20);
+    }
+    logSerial.end();
+    serialSuspendedForLightSleep = true;
+  }
+#endif
+
+  if (enabled) {
+    gpio_hold_dis(BATTERY_LATCH_PIN);
+    gpio_set_direction(BATTERY_LATCH_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(BATTERY_LATCH_PIN, 1);
+    gpio_hold_en(BATTERY_LATCH_PIN);
+  }
+
+  const esp_err_t err = configurePm(enabled);
+  if (err == ESP_OK) {
+    autoLightSleepEnabled = enabled;
+#ifdef ENABLE_SERIAL_LOG
+    if (!enabled && serialSuspendedForLightSleep) {
+      logSerial.begin(115200);
+      logSerial.setTxTimeoutMs(1);
+      serialSuspendedForLightSleep = false;
+      LOG_INF("PWR", "Serial restored after disabling automatic light sleep");
+    }
+#endif
+    LOG_INF("PWR", "Automatic light sleep %s", enabled ? "enabled" : "disabled");
+  } else {
+#ifdef ENABLE_SERIAL_LOG
+    if (enabled && serialSuspendedForLightSleep) {
+      logSerial.begin(115200);
+      logSerial.setTxTimeoutMs(1);
+      serialSuspendedForLightSleep = false;
+    }
+#endif
+    LOG_ERR("PWR", "Failed to %s automatic light sleep: %s", enabled ? "enable" : "disable", esp_err_to_name(err));
+  }
+#else
+  (void)enabled;
+#endif
+}
+
+bool HalPowerManager::isAutoLightSleepEnabled() const {
+#if CONFIG_PM_ENABLE
+  return autoLightSleepEnabled;
+#else
+  return false;
+#endif
+}
+
+bool HalPowerManager::isPowerManagementConfigured() const {
+#if CONFIG_PM_ENABLE
+  return pmConfigured;
+#else
+  return false;
+#endif
+}
+
+int HalPowerManager::getConfiguredMaxFrequencyMhz() const {
+#if CONFIG_PM_ENABLE
+  if (pmConfigured) {
+    esp_pm_config_t config = {};
+    if (esp_pm_get_configuration(&config) == ESP_OK) return config.max_freq_mhz;
+  }
+#endif
+  return normalFreq;
+}
+
+int HalPowerManager::getConfiguredMinFrequencyMhz() const {
+#if CONFIG_PM_ENABLE
+  if (pmConfigured) {
+    esp_pm_config_t config = {};
+    if (esp_pm_get_configuration(&config) == ESP_OK) return config.min_freq_mhz;
+  }
+#endif
+  return isLowPower ? LOW_POWER_FREQ : normalFreq;
 }
 
 void HalPowerManager::setPowerSaving(bool enabled) {
@@ -60,7 +185,19 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   // Otherwise, no change needed
 }
 
-void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
+void HalPowerManager::startDeepSleep(HalGPIO& gpio) {
+#if CONFIG_PM_ENABLE
+  if (pmConfigured && cpuMaxLock != nullptr && !cpuMaxLockAcquired) {
+    LOG_DBG("PWR", "Acquiring CPU max-frequency PM lock before deep sleep");
+    if (esp_pm_lock_acquire(cpuMaxLock) == ESP_OK) {
+      cpuMaxLockAcquired = true;
+      isLowPower = false;
+    }
+  }
+#else
+  setPowerSaving(false);
+#endif
+
   // Ensure that the power button has been released to avoid immediately turning back on if you're holding it
   while (gpio.isPressed(HalGPIO::BTN_POWER)) {
     delay(50);
@@ -78,12 +215,12 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
   // Pre-sleep routines from the original firmware
   // GPIO13 is connected to battery latch MOSFET, we need to make sure it's low during sleep
   // Note that this means the MCU will be completely powered off during sleep, including RTC
-  constexpr gpio_num_t GPIO_SPIWP = GPIO_NUM_13;
-  gpio_set_direction(GPIO_SPIWP, GPIO_MODE_OUTPUT);
-  gpio_set_level(GPIO_SPIWP, 0);
+  gpio_hold_dis(BATTERY_LATCH_PIN);
+  gpio_set_direction(BATTERY_LATCH_PIN, GPIO_MODE_OUTPUT);
+  gpio_set_level(BATTERY_LATCH_PIN, 0);
   esp_sleep_config_gpio_isolate();
   gpio_deep_sleep_hold_en();
-  gpio_hold_en(GPIO_SPIWP);
+  gpio_hold_en(BATTERY_LATCH_PIN);
   pinMode(InputManager::POWER_BUTTON_PIN, INPUT_PULLUP);
   // Arm the wakeup trigger *after* the button is released
   // Note: this is only useful for waking up on USB power. On battery, the MCU will be completely powered off, so the
@@ -145,7 +282,7 @@ HalPowerManager::Lock::Lock() {
   xSemaphoreGive(powerManager.modeMutex);
   if (valid) {
     // Immediately restore normal CPU frequency if currently in low-power mode
-    powerManager.setPowerSaving(false);
+    //powerManager.setPowerSaving(false);
   }
 }
 
