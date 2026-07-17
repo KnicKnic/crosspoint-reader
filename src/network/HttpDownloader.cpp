@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 #include <Logging.h>
-#include <Memory.h>
+#include "../../lib/Memory/Memory.h"
 #include <base64.h>
 
 #include <functional>

@@ -3,7 +3,7 @@
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Logging.h>
-#include <Memory.h>
+#include "../../lib/Memory/Memory.h"
 
 #include <algorithm>
 #include <string_view>

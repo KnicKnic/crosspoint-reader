@@ -4,7 +4,7 @@
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <I18n.h>
-#include <Memory.h>
+#include "../../../lib/Memory/Memory.h"
 
 #include <algorithm>
 

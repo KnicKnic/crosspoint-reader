@@ -3,7 +3,7 @@
 #include <BidiUtils.h>
 #include <GfxRenderer.h>
 #include <Logging.h>
-#include <Memory.h>
+#include "../../../Memory/Memory.h"
 #include <Serialization.h>
 
 #include <cstring>

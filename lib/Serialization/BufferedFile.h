@@ -1,6 +1,7 @@
 #pragma once
 #include <HalStorage.h>
-#include <Memory.h>
+
+#include "../Memory/Memory.h"
 
 #include <algorithm>
 #include <cstring>

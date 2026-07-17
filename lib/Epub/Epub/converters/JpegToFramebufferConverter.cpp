@@ -5,7 +5,7 @@
 #include <HalStorage.h>
 #include <JPEGDEC.h>
 #include <Logging.h>
-#include <Memory.h>
+#include "../../../Memory/Memory.h"
 
 #include <cstdlib>
 #include <memory>

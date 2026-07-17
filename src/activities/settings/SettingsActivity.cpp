@@ -1,6 +1,7 @@
 #include "SettingsActivity.h"
 
 #include <GfxRenderer.h>
+#include <HalPowerManager.h>
 #include <Logging.h>
 
 #include <algorithm>
@@ -193,6 +194,8 @@ void SettingsActivity::toggleCurrentSetting() {
   const auto& setting = (*currentSettings)[selectedSetting];
   const bool sleepScreenChanged = setting.valuePtr == &CrossPointSettings::sleepScreen;
   const bool quickResumeTimeoutChanged = setting.valuePtr == &CrossPointSettings::quickResumeSleepScreen;
+  const bool memoryTestingChanged =
+      setting.valuePtr == &CrossPointSettings::memoryTesting || setting.valuePtr == &CrossPointSettings::autoLightSleep;
 
   if (setting.nameId == StrId::STR_TIME_TO_SLEEP) {
     openSleepTimeoutPicker();
@@ -306,6 +309,9 @@ void SettingsActivity::toggleCurrentSetting() {
 
   syncQuickResumeTimeoutForSleepScreen(sleepScreenChanged, quickResumeTimeoutChanged);
   SETTINGS.saveToFile();
+  if (memoryTestingChanged) {
+    powerManager.configureMemoryTesting(SETTINGS.memoryTesting, SETTINGS.autoLightSleep);
+  }
   rebuildSettingsLists();
   selectedSettingIndex = std::min(selectedSettingIndex, settingsCount);
 }

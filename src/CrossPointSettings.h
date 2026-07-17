@@ -271,6 +271,10 @@ class CrossPointSettings {
   uint8_t removeReadBooksFromRecents = 0;
   // Move epub to /Read/ folder on SD card when finished (0 = disabled, 1 = enabled)
   uint8_t moveFinishedToReadFolder = 0;
+  // Memory testing opt-in. Auto light sleep behavior is only driven while this is enabled.
+  uint8_t memoryTesting = 0;
+  // Allow ESP-IDF automatic light sleep while memory testing is enabled (0 = disabled, 1 = enabled)
+  uint8_t autoLightSleep = 0;
   // Image rendering mode in EPUB reader
   uint8_t imageRendering = IMAGES_DISPLAY;
   // Tilt-based page turning (X3 only — requires QMI8658 IMU)

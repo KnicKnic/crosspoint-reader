@@ -2,6 +2,7 @@
 
 #include <Logging.h>
 #include <WiFi.h>
+#include <esp_err.h>
 #include <esp_sleep.h>
 
 #include <cassert>
@@ -9,6 +10,13 @@
 #include "HalGPIO.h"
 
 HalPowerManager powerManager;  // Singleton instance
+
+namespace {
+void logHeapSnapshot(const char* label) {
+  LOG_INF("PWR", "%s heap: free=%d total=%d minFree=%d maxAlloc=%d", label, ESP.getFreeHeap(), ESP.getHeapSize(),
+          ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
+}
+}  // namespace
 
 void HalPowerManager::begin() {
   if (gpio.deviceIsX3()) {
@@ -25,6 +33,107 @@ void HalPowerManager::begin() {
   assert(modeMutex != nullptr);
 }
 
+void HalPowerManager::configureMemoryTesting(bool memoryTesting, bool autoLightSleep) {
+  logHeapSnapshot("Memory test configure start");
+  LOG_INF("PWR", "Memory testing setting=%s, auto light sleep setting=%s", memoryTesting ? "on" : "off",
+          autoLightSleep ? "on" : "off");
+
+  if (!memoryTesting) {
+    memoryTestingActive = false;
+    autoLightSleepActive = false;
+    setPmLocks(true, true);
+    LOG_INF("PWR", "Memory testing disabled");
+    logHeapSnapshot("Memory test configure done");
+    return;
+  }
+
+#if CROSSPOINT_HAL_HAS_ESP_PM
+  esp_pm_config_t config = {};
+  config.max_freq_mhz = normalFreq > 0 ? normalFreq : getCpuFrequencyMhz();
+  config.min_freq_mhz = LOW_POWER_FREQ;
+  config.light_sleep_enable = autoLightSleep;
+
+  const esp_err_t configureResult = esp_pm_configure(&config);
+  if (configureResult != ESP_OK) {
+    LOG_ERR("PWR", "esp_pm_configure failed: %s", esp_err_to_name(configureResult));
+    memoryTestingActive = false;
+    autoLightSleepActive = false;
+    logHeapSnapshot("After failed PM configure");
+    logHeapSnapshot("Memory test configure done");
+    return;
+  }
+
+  logHeapSnapshot("After PM configure");
+
+  if (!pmCpuLock) {
+    const esp_err_t result = esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "crosspoint_cpu", &pmCpuLock);
+    if (result != ESP_OK) {
+      LOG_ERR("PWR", "CPU PM lock create failed: %s", esp_err_to_name(result));
+    } else {
+      LOG_INF("PWR", "CPU PM lock created");
+    }
+  } else {
+    LOG_INF("PWR", "CPU PM lock already exists");
+  }
+  logHeapSnapshot("After CPU PM lock setup");
+
+  if (autoLightSleep && !pmNoLightSleepLock) {
+    const esp_err_t result = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "crosspoint_awake", &pmNoLightSleepLock);
+    if (result != ESP_OK) {
+      LOG_ERR("PWR", "No-light-sleep PM lock create failed: %s", esp_err_to_name(result));
+    } else {
+      LOG_INF("PWR", "No-light-sleep PM lock created");
+    }
+  } else if (autoLightSleep) {
+    LOG_INF("PWR", "No-light-sleep PM lock already exists");
+  } else {
+    LOG_INF("PWR", "No-light-sleep PM lock not requested");
+  }
+  logHeapSnapshot("After no-light-sleep PM lock setup");
+
+  memoryTestingActive = pmCpuLock != nullptr;
+  autoLightSleepActive = memoryTestingActive && autoLightSleep && pmNoLightSleepLock != nullptr;
+  setPmLocks(memoryTestingActive, autoLightSleepActive);
+  logHeapSnapshot("After PM lock apply");
+  if (autoLightSleepActive) {
+    LOG_INF("PWR", "No-light-sleep PM lock is sticky and will remain held until reboot");
+  }
+  LOG_INF("PWR", "Memory testing %s, auto light sleep %s", memoryTestingActive ? "enabled" : "disabled",
+          autoLightSleepActive ? "enabled" : "disabled");
+  logHeapSnapshot("Memory test configure done");
+#else
+  LOG_ERR("PWR", "Memory testing requested but this build does not have CONFIG_PM_ENABLE");
+  memoryTestingActive = false;
+  autoLightSleepActive = false;
+  logHeapSnapshot("After skipped PM configure");
+  logHeapSnapshot("Memory test configure done");
+#endif
+}
+
+void HalPowerManager::setPmLocks(bool cpuMax, bool noLightSleep) {
+#if CROSSPOINT_HAL_HAS_ESP_PM
+  if (pmCpuLock) {
+    if (cpuMax && !pmCpuLockHeld) {
+      const esp_err_t result = esp_pm_lock_acquire(pmCpuLock);
+      if (result == ESP_OK) pmCpuLockHeld = true;
+    } else if (!cpuMax && pmCpuLockHeld) {
+      const esp_err_t result = esp_pm_lock_release(pmCpuLock);
+      if (result == ESP_OK) pmCpuLockHeld = false;
+    }
+  }
+
+  if (pmNoLightSleepLock) {
+    if (noLightSleep && !pmNoLightSleepLockHeld) {
+      const esp_err_t result = esp_pm_lock_acquire(pmNoLightSleepLock);
+      if (result == ESP_OK) pmNoLightSleepLockHeld = true;
+    }
+  }
+#else
+  (void)cpuMax;
+  (void)noLightSleep;
+#endif
+}
+
 void HalPowerManager::setPowerSaving(bool enabled) {
   if (normalFreq <= 0) {
     return;  // invalid state
@@ -39,6 +148,13 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   // Note: We don't use mutex here to avoid too much overhead,
   // it's not very important if we read a slightly stale value for currentLockMode
   const LockMode mode = currentLockMode;
+
+  if (memoryTestingActive) {
+    const bool lowPowerAllowed = mode == None && enabled;
+    setPmLocks(!lowPowerAllowed, autoLightSleepActive);
+    isLowPower = lowPowerAllowed;
+    return;
+  }
 
   if (mode == None && enabled && !isLowPower) {
     LOG_DBG("PWR", "Going to low-power mode");

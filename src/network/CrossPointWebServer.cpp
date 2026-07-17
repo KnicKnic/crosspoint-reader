@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <FsHelpers.h>
 #include <HalGPIO.h>
+#include <HalPowerManager.h>
 #include <HalStorage.h>
 #include <Logging.h>
 #include <WiFi.h>
@@ -1250,10 +1251,14 @@ void CrossPointWebServer::handlePostSettings() {
 
   const auto& settings = getSettingsList(&sdFontSystem.registry());
   int applied = 0;
+  bool memoryTestingChanged = false;
 
   for (const auto& s : settings) {
     if (!s.key) continue;
     if (!doc[s.key].is<JsonVariant>()) continue;
+    if (s.valuePtr == &CrossPointSettings::memoryTesting || s.valuePtr == &CrossPointSettings::autoLightSleep) {
+      memoryTestingChanged = true;
+    }
 
     switch (s.type) {
       case SettingType::TOGGLE: {
@@ -1306,6 +1311,9 @@ void CrossPointWebServer::handlePostSettings() {
   }
 
   SETTINGS.saveToFile();
+  if (memoryTestingChanged) {
+    powerManager.configureMemoryTesting(SETTINGS.memoryTesting, SETTINGS.autoLightSleep);
+  }
 
   LOG_DBG("WEB", "Applied %d setting(s)", applied);
   server->send(200, "text/plain", String("Applied ") + String(applied) + " setting(s)");

@@ -11,12 +11,26 @@
 
 #include "HalGPIO.h"
 
+#if __has_include(<esp_pm.h>)
+#include <esp_pm.h>
+#if defined(CONFIG_PM_ENABLE) && CONFIG_PM_ENABLE
+#define CROSSPOINT_HAL_HAS_ESP_PM 1
+#endif
+#endif
+#ifndef CROSSPOINT_HAL_HAS_ESP_PM
+#define CROSSPOINT_HAL_HAS_ESP_PM 0
+#endif
+
 class HalPowerManager;
 extern HalPowerManager powerManager;  // Singleton
 
 class HalPowerManager {
   int normalFreq = 0;  // MHz
   bool isLowPower = false;
+  bool memoryTestingActive = false;
+  bool autoLightSleepActive = false;
+  bool pmCpuLockHeld = false;
+  bool pmNoLightSleepLockHeld = false;
 
   // I2C fuel gauge configuration for X3 battery monitoring
   bool _batteryUseI2C = false;                   // True if using I2C fuel gauge (X3), false for ADC (X4)
@@ -27,12 +41,20 @@ class HalPowerManager {
   LockMode currentLockMode = None;
   SemaphoreHandle_t modeMutex = nullptr;  // Protect access to currentLockMode
 
+#if CROSSPOINT_HAL_HAS_ESP_PM
+  esp_pm_lock_handle_t pmCpuLock = nullptr;
+  esp_pm_lock_handle_t pmNoLightSleepLock = nullptr;
+#endif
+
+  void setPmLocks(bool cpuMax, bool noLightSleep);
+
  public:
   static constexpr int LOW_POWER_FREQ = 10;                    // MHz
   static constexpr unsigned long IDLE_POWER_SAVING_MS = 3000;  // ms
   static constexpr unsigned long BATTERY_POLL_MS = 1500;       // ms
 
   void begin();
+  void configureMemoryTesting(bool memoryTesting, bool autoLightSleep);
 
   // Control CPU frequency for power saving
   void setPowerSaving(bool enabled);

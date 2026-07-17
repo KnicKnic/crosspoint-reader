@@ -2,7 +2,7 @@
 
 #include <HalStorage.h>
 #include <Logging.h>
-#include <Memory.h>
+#include "../../Memory/Memory.h"
 #include <Serialization.h>
 
 #include "Epub/css/CssParser.h"
