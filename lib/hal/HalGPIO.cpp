@@ -5,6 +5,11 @@
 #include <Wire.h>
 #include <esp_sleep.h>
 
+#include <algorithm>
+
+#include "HalPowerRuntimeConfig.h"
+#include "HalPowerStats.h"
+
 // Global HalGPIO instance
 HalGPIO gpio;
 
@@ -98,6 +103,7 @@ bool probeQMI8658Signature() {
 }
 
 X3ProbeResult runX3ProbePass() {
+  HalPowerStats::ScopedProbe probe(HalPowerStats::Probe::X3Fingerprint);
   X3ProbeResult result;
   Wire.begin(X3_I2C_SDA, X3_I2C_SCL, X3_I2C_FREQ);
   Wire.setTimeOut(6);
@@ -271,16 +277,30 @@ void HalGPIO::verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPre
 
 bool HalGPIO::isUsbConnected() const {
   if (deviceIsX3()) {
+    if (!halPowerConfig.usbPollingEnabled) {
+      return cachedUsbConnected;
+    }
+    const unsigned long now = millis();
+    const unsigned long pollMs =
+        static_cast<unsigned long>(std::max<uint8_t>(1, halPowerConfig.usbPollIntervalTenths)) * 100UL;
+    if (lastUsbPollMs != 0 && (now - lastUsbPollMs) < pollMs) {
+      return cachedUsbConnected;
+    }
+
     // X3: infer USB/charging via BQ27220 Current() register (0x0C, signed mA).
     // Positive current means charging.
+    HalPowerStats::ScopedProbe probe(HalPowerStats::Probe::UsbCharge);
     for (uint8_t attempt = 0; attempt < 2; ++attempt) {
       int16_t currentMa = 0;
       if (X3GPIO::readBQ27220CurrentMA(&currentMa)) {
-        return currentMa > 0;
+        cachedUsbConnected = currentMa > 0;
+        lastUsbPollMs = now;
+        return cachedUsbConnected;
       }
       delay(2);
     }
-    return false;
+    lastUsbPollMs = now;
+    return cachedUsbConnected;
   }
   // U0RXD/GPIO20 reads HIGH when USB is connected
   return digitalRead(UART0_RXD) == HIGH;

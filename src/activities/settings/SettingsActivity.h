@@ -25,6 +25,7 @@ enum class SettingAction {
   Language,
   DownloadFonts,
   PowerStats,
+  PowerSettings,
 };
 
 struct SettingInfo {

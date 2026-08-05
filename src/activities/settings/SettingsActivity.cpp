@@ -18,6 +18,7 @@
 #include "MappedInputManager.h"
 #include "OpdsServerListActivity.h"
 #include "OtaUpdateActivity.h"
+#include "PowerSettingsActivity.h"
 #include "PowerStatsActivity.h"
 #include "SdCardFontSystem.h"
 #include "SdFirmwareUpdateActivity.h"
@@ -67,6 +68,7 @@ void SettingsActivity::rebuildSettingsLists() {
   systemSettings.push_back(SettingInfo::Action(StrId::STR_CLEAR_READING_CACHE, SettingAction::ClearCache));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
+  systemSettings.push_back(SettingInfo::Action(StrId::STR_POWER_SETTINGS, SettingAction::PowerSettings));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_POWER_STATS, SettingAction::PowerStats));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_LANGUAGE, SettingAction::Language));
   // Insert "Manage Fonts" right after the font family setting so users discover it naturally
@@ -304,6 +306,9 @@ void SettingsActivity::toggleCurrentSetting() {
         break;
       case SettingAction::PowerStats:
         startActivityForResult(std::make_unique<PowerStatsActivity>(renderer, mappedInput), resultHandler);
+        break;
+      case SettingAction::PowerSettings:
+        startActivityForResult(std::make_unique<PowerSettingsActivity>(renderer, mappedInput), resultHandler);
         break;
       case SettingAction::None:
         // Do nothing

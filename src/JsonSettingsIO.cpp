@@ -150,6 +150,19 @@ bool JsonSettingsIO::saveSettings(const CrossPointSettings& s, const char* path)
     doc["sdFontFamilyName"] = s.sdFontFamilyName;
   }
 
+  doc["powerSavingEnabled"] = s.powerSavingEnabled;
+  doc["idlePowerSavingDelaySec"] = s.idlePowerSavingDelaySec;
+  doc["lowPowerFrequencyMhz"] = s.lowPowerFrequencyMhz;
+  doc["maxCpuFrequencyMhz"] = s.maxCpuFrequencyMhz;
+  doc["usbPollingEnabled"] = s.usbPollingEnabled;
+  doc["usbPollIntervalTenths"] = s.usbPollIntervalTenths;
+  doc["batteryPollingEnabled"] = s.batteryPollingEnabled;
+  doc["batteryPollIntervalTenths"] = s.batteryPollIntervalTenths;
+  doc["clockPollingEnabled"] = s.clockPollingEnabled;
+  doc["clockPollIntervalTenths"] = s.clockPollIntervalTenths;
+  doc["tiltPollingEnabled"] = s.tiltPollingEnabled;
+  doc["tiltPollIntervalMs"] = s.tiltPollIntervalMs;
+
   // Language -- managed by LanguageSelectActivity, not in SettingsList.
   // Stored as ISO code string ("EN", "DE", ...) for stability across enum reorders.
   doc["language"] = (s.language < getLanguageCount()) ? LANGUAGE_CODES[s.language] : "EN";
@@ -169,6 +182,11 @@ bool JsonSettingsIO::loadSettings(CrossPointSettings& s, const char* json, bool*
   }
 
   auto clamp = [](uint8_t val, uint8_t maxVal, uint8_t def) -> uint8_t { return val < maxVal ? val : def; };
+  auto clampRange = [](uint8_t val, uint8_t minVal, uint8_t maxVal) -> uint8_t {
+    if (val < minVal) return minVal;
+    if (val > maxVal) return maxVal;
+    return val;
+  };
 
   // Legacy migration: if statusBarChapterPageCount is absent this is a pre-refactor settings file.
   // Populate s with migrated values now so the generic loop below picks them up as defaults and clamps them.
@@ -255,6 +273,20 @@ bool JsonSettingsIO::loadSettings(CrossPointSettings& s, const char* json, bool*
   } else if (storedFontFamily >= CrossPointSettings::BUILTIN_FONT_COUNT) {
     if (needsResave) *needsResave = true;
   }
+
+  s.powerSavingEnabled = clamp(doc["powerSavingEnabled"] | s.powerSavingEnabled, 2, s.powerSavingEnabled);
+  s.idlePowerSavingDelaySec = clampRange(doc["idlePowerSavingDelaySec"] | s.idlePowerSavingDelaySec, 1, 30);
+  s.lowPowerFrequencyMhz = clampRange(doc["lowPowerFrequencyMhz"] | s.lowPowerFrequencyMhz, 10, 160);
+  s.maxCpuFrequencyMhz = clampRange(doc["maxCpuFrequencyMhz"] | s.maxCpuFrequencyMhz, 80, 240);
+  s.usbPollingEnabled = clamp(doc["usbPollingEnabled"] | s.usbPollingEnabled, 2, s.usbPollingEnabled);
+  s.usbPollIntervalTenths = clampRange(doc["usbPollIntervalTenths"] | s.usbPollIntervalTenths, 1, 200);
+  s.batteryPollingEnabled = clamp(doc["batteryPollingEnabled"] | s.batteryPollingEnabled, 2, s.batteryPollingEnabled);
+  s.batteryPollIntervalTenths =
+      clampRange(doc["batteryPollIntervalTenths"] | s.batteryPollIntervalTenths, 1, 200);
+  s.clockPollingEnabled = clamp(doc["clockPollingEnabled"] | s.clockPollingEnabled, 2, s.clockPollingEnabled);
+  s.clockPollIntervalTenths = clampRange(doc["clockPollIntervalTenths"] | s.clockPollIntervalTenths, 10, 250);
+  s.tiltPollingEnabled = clamp(doc["tiltPollingEnabled"] | s.tiltPollingEnabled, 2, s.tiltPollingEnabled);
+  s.tiltPollIntervalMs = clampRange(doc["tiltPollIntervalMs"] | s.tiltPollIntervalMs, 20, 250);
 
   // Language -- stored as code string for stability across enum reorders.
   if (doc["language"].is<const char*>()) {

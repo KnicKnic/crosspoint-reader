@@ -5,7 +5,11 @@
 #include <esp_sntp.h>
 #include <time.h>
 
+#include <algorithm>
 #include <cassert>
+
+#include "HalPowerRuntimeConfig.h"
+#include "HalPowerStats.h"
 
 HalClock halClock;  // Singleton instance
 
@@ -51,13 +55,22 @@ bool HalClock::getTime(uint8_t& hour, uint8_t& minute) const {
   if (!_available) return false;
 
   const unsigned long now = millis();
-  if (_lastPollMs != 0 && (now - _lastPollMs) < CLOCK_POLL_MS) {
+  if (!halPowerConfig.clockPollingEnabled) {
+    if (!_hasCachedTime) return false;
+    hour = _cachedHour;
+    minute = _cachedMinute;
+    return true;
+  }
+  const unsigned long pollMs =
+      static_cast<unsigned long>(std::max<uint8_t>(10, halPowerConfig.clockPollIntervalTenths)) * 100UL;
+  if (_lastPollMs != 0 && (now - _lastPollMs) < pollMs) {
     hour = _cachedHour;
     minute = _cachedMinute;
     return true;
   }
 
   // Read 3 bytes starting at register 0x00: seconds, minutes, hours
+  HalPowerStats::ScopedProbe probe(HalPowerStats::Probe::RtcClock);
   Wire.beginTransmission(I2C_ADDR_DS3231);
   Wire.write(DS3231_SEC_REG);
   if (Wire.endTransmission(false) != 0) {

@@ -9,6 +9,8 @@
 #include <cassert>
 
 #include "HalGPIO.h"
+#include "HalPowerRuntimeConfig.h"
+#include "HalPowerStats.h"
 
 namespace {
 constexpr gpio_num_t BATTERY_LATCH_PIN = GPIO_NUM_13;
@@ -35,9 +37,14 @@ void HalPowerManager::begin() {
   if (err == ESP_OK) {
     err = esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "crosspoint-active", &cpuMaxLock);
     if (err == ESP_OK) {
-      pmConfigured = true;
-      LOG_INF("PWR", "ESP-IDF power management enabled: max=%d MHz min=%d MHz autosleep=off",
-              getConfiguredMaxFrequencyMhz(), getConfiguredMinFrequencyMhz());
+      err = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "crosspoint-awake", &noLightSleepLock);
+      if (err == ESP_OK) {
+        pmConfigured = true;
+        LOG_INF("PWR", "ESP-IDF power management enabled: max=%d MHz min=%d MHz autosleep=off",
+                getConfiguredMaxFrequencyMhz(), getConfiguredMinFrequencyMhz());
+      } else {
+        LOG_ERR("PWR", "Failed to create no-light-sleep PM lock: %s", esp_err_to_name(err));
+      }
     } else {
       LOG_ERR("PWR", "Failed to create CPU PM lock: %s", esp_err_to_name(err));
     }
@@ -50,13 +57,33 @@ void HalPowerManager::begin() {
 #if CONFIG_PM_ENABLE
 esp_err_t HalPowerManager::configurePm(bool lightSleepEnable) {
   esp_pm_config_t pmConfig = {};
-  pmConfig.max_freq_mhz = DESIRED_MAX_FREQ;
-  pmConfig.min_freq_mhz = LOW_POWER_FREQ;
+  const int maxFreq = std::clamp(static_cast<int>(halPowerConfig.maxCpuFrequencyMhz), 80, 240);
+  const int minFreq = std::min(std::clamp(static_cast<int>(halPowerConfig.lowPowerFrequencyMhz), 10, 160), maxFreq);
+  pmConfig.max_freq_mhz = maxFreq;
+  pmConfig.min_freq_mhz = minFreq;
   pmConfig.light_sleep_enable = lightSleepEnable;
 
   return esp_pm_configure(&pmConfig);
 }
 #endif
+
+void HalPowerManager::applyRuntimeSettings() {
+#if CONFIG_PM_ENABLE
+  if (pmConfigured) {
+    const esp_err_t err = configurePm(autoLightSleepEnabled);
+    if (err != ESP_OK) {
+      LOG_ERR("PWR", "Failed to apply runtime PM settings: %s", esp_err_to_name(err));
+    }
+  }
+#endif
+  if (!halPowerConfig.powerSavingEnabled) {
+    setPowerSaving(false);
+  }
+}
+
+unsigned long HalPowerManager::getIdlePowerSavingMs() const {
+  return static_cast<unsigned long>(std::max<uint8_t>(1, halPowerConfig.idlePowerSavingDelaySec)) * 1000UL;
+}
 
 void HalPowerManager::setAutoLightSleep(bool enabled) {
 #if CONFIG_PM_ENABLE
@@ -147,10 +174,14 @@ int HalPowerManager::getConfiguredMinFrequencyMhz() const {
     if (esp_pm_get_configuration(&config) == ESP_OK) return config.min_freq_mhz;
   }
 #endif
-  return isLowPower ? LOW_POWER_FREQ : normalFreq;
+  return isLowPower ? std::clamp(static_cast<int>(halPowerConfig.lowPowerFrequencyMhz), 10, 160) : normalFreq;
 }
 
 void HalPowerManager::setPowerSaving(bool enabled) {
+  if (!halPowerConfig.powerSavingEnabled) {
+    enabled = false;
+  }
+
   if (normalFreq <= 0) {
     return;  // invalid state
   }
@@ -167,8 +198,10 @@ void HalPowerManager::setPowerSaving(bool enabled) {
 
   if (mode == None && enabled && !isLowPower) {
     LOG_DBG("PWR", "Going to low-power mode");
-    if (!setCpuFrequencyMhz(LOW_POWER_FREQ)) {
-      LOG_DBG("PWR", "Failed to set CPU frequency = %d MHz", LOW_POWER_FREQ);
+    const int lowFreq =
+        std::min(std::clamp(static_cast<int>(halPowerConfig.lowPowerFrequencyMhz), 10, 160), normalFreq);
+    if (!setCpuFrequencyMhz(lowFreq)) {
+      LOG_DBG("PWR", "Failed to set CPU frequency = %d MHz", lowFreq);
       return;
     }
     isLowPower = true;
@@ -233,13 +266,19 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) {
 
 uint16_t HalPowerManager::getBatteryPercentage() const {
   if (_batteryUseI2C) {
+    if (!halPowerConfig.batteryPollingEnabled) {
+      return _batteryCachedPercent;
+    }
     const unsigned long now = millis();
-    if (_batteryLastPollMs != 0 && (now - _batteryLastPollMs) < BATTERY_POLL_MS) {
+    const unsigned long pollMs =
+        static_cast<unsigned long>(std::max<uint8_t>(1, halPowerConfig.batteryPollIntervalTenths)) * 100UL;
+    if (_batteryLastPollMs != 0 && (now - _batteryLastPollMs) < pollMs) {
       return _batteryCachedPercent;
     }
 
     // Read SOC directly from I2C fuel gauge (16-bit LE register).
     // On I2C error, keep last known value to avoid UI jitter/slowdowns.
+    HalPowerStats::ScopedProbe probe(HalPowerStats::Probe::BatteryPercent);
     Wire.beginTransmission(I2C_ADDR_BQ27220);
     Wire.write(BQ27220_SOC_REG);
     if (Wire.endTransmission(false) != 0) {
@@ -281,12 +320,27 @@ HalPowerManager::Lock::Lock() {
   }
   xSemaphoreGive(powerManager.modeMutex);
   if (valid) {
-    // Immediately restore normal CPU frequency if currently in low-power mode
-    //powerManager.setPowerSaving(false);
+    powerManager.setPowerSaving(false);
+#if CONFIG_PM_ENABLE
+    if (powerManager.cpuMaxLock != nullptr && esp_pm_lock_acquire(powerManager.cpuMaxLock) == ESP_OK) {
+      cpuLockAcquired = true;
+    }
+    if (powerManager.noLightSleepLock != nullptr && esp_pm_lock_acquire(powerManager.noLightSleepLock) == ESP_OK) {
+      lightSleepLockAcquired = true;
+    }
+#endif
   }
 }
 
 HalPowerManager::Lock::~Lock() {
+#if CONFIG_PM_ENABLE
+  if (lightSleepLockAcquired && powerManager.noLightSleepLock != nullptr) {
+    esp_pm_lock_release(powerManager.noLightSleepLock);
+  }
+  if (cpuLockAcquired && powerManager.cpuMaxLock != nullptr) {
+    esp_pm_lock_release(powerManager.cpuMaxLock);
+  }
+#endif
   xSemaphoreTake(powerManager.modeMutex, portMAX_DELAY);
   if (valid) {
     powerManager.currentLockMode = None;

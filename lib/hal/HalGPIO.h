@@ -45,6 +45,8 @@ class HalGPIO {
 
   bool lastUsbConnected = false;
   bool usbStateChanged = false;
+  mutable bool cachedUsbConnected = false;
+  mutable unsigned long lastUsbPollMs = 0;
 
  public:
   enum class DeviceType : uint8_t { X4, X3 };

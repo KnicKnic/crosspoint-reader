@@ -265,6 +265,19 @@ class CrossPointSettings {
   uint8_t moveFinishedToReadFolder = 0;
   // ESP-IDF automatic light sleep while idle (0 = disabled, 1 = enabled). Serial logging is disabled while active.
   uint8_t autoLightSleep = 0;
+  // Runtime power tuning. Poll intervals use 100 ms units unless noted otherwise.
+  uint8_t powerSavingEnabled = 1;
+  uint8_t idlePowerSavingDelaySec = 3;
+  uint8_t lowPowerFrequencyMhz = 10;
+  uint8_t maxCpuFrequencyMhz = 160;
+  uint8_t usbPollingEnabled = 1;
+  uint8_t usbPollIntervalTenths = 10;
+  uint8_t batteryPollingEnabled = 1;
+  uint8_t batteryPollIntervalTenths = 15;
+  uint8_t clockPollingEnabled = 1;
+  uint8_t clockPollIntervalTenths = 100;
+  uint8_t tiltPollingEnabled = 1;
+  uint8_t tiltPollIntervalMs = 50;
   // Image rendering mode in EPUB reader
   uint8_t imageRendering = IMAGES_DISPLAY;
   // Tilt-based page turning (X3 only — requires QMI8658 IMU)

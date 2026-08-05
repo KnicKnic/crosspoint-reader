@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <HalPowerManager.h>
+#include <HalPowerStats.h>
 #include <Logging.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -20,7 +21,7 @@
 
 namespace {
 
-constexpr size_t MAX_DISPLAY_LINES_PER_SECTION = 6;
+constexpr size_t MAX_DISPLAY_LINES_PER_SECTION = 12;
 constexpr size_t MAX_TASKS_TRACKED = 256;
 
 struct RankedLine {
@@ -292,6 +293,22 @@ std::vector<std::string> topTaskLines() {
   return lines;
 }
 
+std::vector<std::string> hardwareProbeLines() {
+  std::vector<std::string> lines;
+  for (uint8_t i = 0; i < static_cast<uint8_t>(HalPowerStats::Probe::Count); i++) {
+    const auto probe = static_cast<HalPowerStats::Probe>(i);
+    const auto counter = HalPowerStats::get(probe);
+    const unsigned long long avgUs =
+        counter.queries == 0 ? 0ULL : static_cast<unsigned long long>(counter.totalUs / counter.queries);
+    char line[96];
+    snprintf(line, sizeof(line), "%-12s count=%lu time=%s avg=%lluus", HalPowerStats::name(probe),
+             static_cast<unsigned long>(counter.queries), formatDurationUs(counter.totalUs).c_str(),
+             avgUs);
+    lines.emplace_back(line);
+  }
+  return lines;
+}
+
 void appendSection(std::vector<std::string>& out, const std::vector<std::string>& lines) {
   if (!out.empty()) out.emplace_back();
   out.insert(out.end(), lines.begin(), lines.end());
@@ -305,9 +322,9 @@ Snapshot collect() {
   Snapshot snapshot;
 
   char line[96];
-  snprintf(line, sizeof(line), "CPU current=%d MHz policy=%d-%d MHz desired-max=%d MHz", getCpuFrequencyMhz(),
+  snprintf(line, sizeof(line), "CPU current=%d MHz policy=%d-%d MHz configured-max=%d MHz", getCpuFrequencyMhz(),
            powerManager.getConfiguredMinFrequencyMhz(), powerManager.getConfiguredMaxFrequencyMhz(),
-           HalPowerManager::DESIRED_MAX_FREQ);
+           powerManager.getConfiguredMaxFrequencyMhz());
   snapshot.summaryLines.emplace_back(line);
 
   snprintf(line, sizeof(line), "DFS=%s tickless=%s auto-light-sleep=%s pm=%s", CONFIG_PM_DFS_INIT_AUTO ? "on" : "off",
@@ -326,6 +343,8 @@ Snapshot collect() {
   snprintf(line, sizeof(line), "Heap free=%lu min=%lu maxalloc=%lu", static_cast<unsigned long>(ESP.getFreeHeap()),
            static_cast<unsigned long>(ESP.getMinFreeHeap()), static_cast<unsigned long>(ESP.getMaxAllocHeap()));
   snapshot.summaryLines.emplace_back(line);
+
+  snapshot.hardwareLines = hardwareProbeLines();
 
   snapshot.taskLines = topTaskLines();
 #if CONFIG_PM_ENABLE
@@ -346,6 +365,7 @@ Snapshot collect() {
 std::vector<std::string> buildDisplayLines(const Snapshot& snapshot) {
   std::vector<std::string> lines;
   appendSection(lines, snapshot.summaryLines);
+  appendSection(lines, snapshot.hardwareLines);
   appendSection(lines, snapshot.pmModeLines);
   appendSection(lines, snapshot.taskLines);
   appendSection(lines, snapshot.lockLines);

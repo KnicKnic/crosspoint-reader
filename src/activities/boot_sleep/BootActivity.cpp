@@ -1,6 +1,7 @@
 #include "BootActivity.h"
 
 #include <GfxRenderer.h>
+#include <HalPowerManager.h>
 #include <I18n.h>
 
 #include "fontIds.h"
@@ -8,6 +9,7 @@
 
 void BootActivity::onEnter() {
   Activity::onEnter();
+  HalPowerManager::Lock powerLock;
 
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();

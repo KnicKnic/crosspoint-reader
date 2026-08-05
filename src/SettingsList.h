@@ -194,7 +194,7 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
         SettingInfo::Toggle(StrId::STR_MOVE_FINISHED_TO_READ, &CrossPointSettings::moveFinishedToReadFolder,
                             "moveFinishedToReadFolder", StrId::STR_CAT_SYSTEM),
         SettingInfo::Toggle(StrId::STR_AUTO_LIGHT_SLEEP, &CrossPointSettings::autoLightSleep, "autoLightSleep",
-                            StrId::STR_CAT_SYSTEM),
+                            StrId::STR_NONE_OPT),
 
         // --- KOReader Sync (web-only, uses KOReaderCredentialStore) ---
         SettingInfo::DynamicString(

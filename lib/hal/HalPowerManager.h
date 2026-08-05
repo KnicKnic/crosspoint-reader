@@ -33,6 +33,7 @@ class HalPowerManager {
   SemaphoreHandle_t modeMutex = nullptr;  // Protect access to currentLockMode
 #if CONFIG_PM_ENABLE
   esp_pm_lock_handle_t cpuMaxLock = nullptr;
+  esp_pm_lock_handle_t noLightSleepLock = nullptr;
   bool cpuMaxLockAcquired = false;
   bool pmConfigured = false;
   bool autoLightSleepEnabled = false;
@@ -50,6 +51,8 @@ class HalPowerManager {
 
   // Control CPU frequency for power saving
   void setPowerSaving(bool enabled);
+  void applyRuntimeSettings();
+  unsigned long getIdlePowerSavingMs() const;
 
   void setAutoLightSleep(bool enabled);
   bool isAutoLightSleepEnabled() const;
@@ -70,6 +73,8 @@ class HalPowerManager {
   class Lock {
     friend class HalPowerManager;
     bool valid = false;
+    bool cpuLockAcquired = false;
+    bool lightSleepLockAcquired = false;
 
    public:
     explicit Lock();

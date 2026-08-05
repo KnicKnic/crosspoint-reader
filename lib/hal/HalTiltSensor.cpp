@@ -2,6 +2,11 @@
 
 #include <Logging.h>
 
+#include <algorithm>
+
+#include "HalPowerRuntimeConfig.h"
+#include "HalPowerStats.h"
+
 HalTiltSensor halTiltSensor;  // Singleton instance
 
 bool HalTiltSensor::writeReg(uint8_t reg, uint8_t val) const {
@@ -132,17 +137,19 @@ void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const 
     return;
   }
 
+  const bool tiltEnabled = (mode != CrossPointTiltPageTurn::TILT_OFF) && halPowerConfig.tiltPollingEnabled;
+
   // State machine: wake up or sleep based on the enabled flag
-  if ((mode != CrossPointTiltPageTurn::TILT_OFF) && !_isAwake) {
+  if (tiltEnabled && !_isAwake) {
     _isAwake = wake();
     return;
-  } else if ((mode == CrossPointTiltPageTurn::TILT_OFF) && _isAwake) {
+  } else if (!tiltEnabled && _isAwake) {
     _isAwake = !deepSleep();
     return;
   }
 
   // If disabled, skip the rest of the polling logic and avoid unnecessary I2C traffic in non-reader activities
-  if ((mode == CrossPointTiltPageTurn::TILT_OFF) || !inReader) {
+  if (!tiltEnabled || !inReader) {
     return;
   }
 
@@ -152,14 +159,18 @@ void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const 
     return;
   }
 
-  if ((now - _lastPollMs) < POLL_INTERVAL_MS) {
+  const unsigned long pollMs = std::max<unsigned long>(20, halPowerConfig.tiltPollIntervalMs);
+  if ((now - _lastPollMs) < pollMs) {
     return;
   }
   _lastPollMs = now;
 
   float gx, gy, gz;
-  if (!readGyro(gx, gy, gz)) {
-    return;
+  {
+    HalPowerStats::ScopedProbe probe(HalPowerStats::Probe::ImuGyro);
+    if (!readGyro(gx, gy, gz)) {
+      return;
+    }
   }
 
   // Map the gyro axis to left/right tilt based on reader orientation.
