@@ -321,14 +321,24 @@ namespace PowerProfiler {
 Snapshot collect() {
   Snapshot snapshot;
 
+#if defined(CONFIG_PM_DFS_INIT_AUTO) && CONFIG_PM_DFS_INIT_AUTO
+  constexpr const char* dfsStatus = "on";
+#else
+  constexpr const char* dfsStatus = "off";
+#endif
+#if defined(CONFIG_FREERTOS_USE_TICKLESS_IDLE) && CONFIG_FREERTOS_USE_TICKLESS_IDLE
+  constexpr const char* ticklessStatus = "on";
+#else
+  constexpr const char* ticklessStatus = "off";
+#endif
+
   char line[96];
   snprintf(line, sizeof(line), "CPU current=%d MHz policy=%d-%d MHz configured-max=%d MHz", getCpuFrequencyMhz(),
            powerManager.getConfiguredMinFrequencyMhz(), powerManager.getConfiguredMaxFrequencyMhz(),
            powerManager.getConfiguredMaxFrequencyMhz());
   snapshot.summaryLines.emplace_back(line);
 
-  snprintf(line, sizeof(line), "DFS=%s tickless=%s auto-light-sleep=%s pm=%s", CONFIG_PM_DFS_INIT_AUTO ? "on" : "off",
-           CONFIG_FREERTOS_USE_TICKLESS_IDLE ? "on" : "off",
+  snprintf(line, sizeof(line), "DFS=%s tickless=%s auto-light-sleep=%s pm=%s", dfsStatus, ticklessStatus,
            powerManager.isAutoLightSleepEnabled() ? "on" : "off",
            powerManager.isPowerManagementConfigured() ? "configured" : "off");
   snapshot.summaryLines.emplace_back(line);
